@@ -8,8 +8,9 @@
 #                A launch that merely exits 0 proves nothing, because Alchemy
 #                calls System.exit(0) on its "no modules found" path.
 #
-# Deliberately absent: any deploy/publish step. This repo has no release
-# automation to keep in sync, and publishing is not part of Workstream 1.
+# Deliberately absent: any deploy/publish step. Building on every push and publishing
+# on a tag are different jobs with different blast radii - see release.yml, which is the
+# only workflow allowed to make anything public, and which this workflow does not run.
 name: CI
 
 on:
