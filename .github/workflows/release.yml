@@ -186,19 +186,23 @@ jobs:
           } > RELEASE_BODY.md
           cat RELEASE_BODY.md
 
-      # gh-release's release_body_path defaults to empty, which would silently publish
-      # a bodyless release, and gh_release_files_glob defaults to "no files", which
-      # would silently publish no assets. Both are set explicitly.
+      # softprops/action-gh-release, pinned to a released tag. `files` is a
+      # newline-delimited list of globs, and a glob that matches nothing is NOT an error
+      # by default - so fail_on_unmatched_files is set explicitly. Without it, a release
+      # that uploaded no assets would still be a green run with a published tag in front
+      # of it, which is the one failure mode this step must not have.
+      #
+      # (The pin is worth checking against the registry: an earlier draft of this step
+      # named an action that does not exist.)
       - name: Create the release
-        uses: cloudposse/gh-release-action@v1.1.14
+        uses: softprops/action-gh-release@v3.0.3
         with:
-          method: gh_release
-          operation: create
-          tag: ${{ github.ref_name }}
-          release_title: Alchemy ${{ github.ref_name }} (unofficial)
-          release_body_path: RELEASE_BODY.md
-          release_directory: assets
-          gh_release_files_glob: '*.tar.gz;*.zip;*.txt'
-          make_latest: 'false'
-          draft: 'false'
-          prerelease: 'false'
+          tag_name: ${{ github.ref_name }}
+          name: Alchemy ${{ github.ref_name }} (unofficial)
+          body_path: RELEASE_BODY.md
+          files: |
+            assets/*.tar.gz
+            assets/*.zip
+            assets/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          make_latest: 'true'
