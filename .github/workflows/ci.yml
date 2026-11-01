@@ -100,6 +100,13 @@ jobs:
           fi
           status=$?
 
+          # Unconditional, and in the step log as well as the summary: annotations have
+          # been observed to go missing for a failing job, and a GUI smoke test that
+          # fails with no verdict visible anywhere is the worst case for whoever is next.
+          echo "---- smoke-result.txt ----"
+          cat "$MARKER" 2>/dev/null || echo "(missing: harness died before writing results)"
+          echo "------------------------------"
+
           {
             echo "## smoke-result.txt"
             echo '```'
