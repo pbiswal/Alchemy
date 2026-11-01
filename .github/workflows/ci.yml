@@ -1,0 +1,153 @@
+# Continuous integration for the revived build (MAINTENANCE.md, Workstream 1).
+#
+# Each run proves two distinct things:
+#   build      - every source file compiles at --release 17 against the vendored
+#                lib/ jars, the app jar assembles, and all module archives get
+#                packaged in the layout AlcPlugins discovers.
+#   smokeTest  - the app actually boots and registers every module archive.
+#                A launch that merely exits 0 proves nothing, because Alchemy
+#                calls System.exit(0) on its "no modules found" path.
+#
+# Deliberately absent: any deploy/publish step. Building on every push and publishing
+# on a tag are different jobs with different blast radii - see release.yml, which is the
+# only workflow allowed to make anything public, and which this workflow does not run.
+name: CI
+
+on:
+  # Pushes to long-lived/integration branches plus maintenance branches. Other
+  # branches still get coverage: opening a pull request triggers the same matrix.
+  push:
+    branches: [master, 'chore/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # One shell for all three OSes so `./gradlew` is spelled the same way; the
+    # Gradle launcher script handles MSYS paths under git-bash on Windows.
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / JDK ${{ matrix.jdk }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A breakage on one platform must not hide the state of the other two.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # 17 is the committed baseline (--release 17); 21/25 are the LTS and the
+        # current JDK the source is expected to keep building on.
+        jdk: [17, 21, 25]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK ${{ matrix.jdk }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.jdk }}
+
+      # Caches the wrapper distribution and dependency lookups, and validates the
+      # committed gradle-wrapper.jar against the known-good checksum list.
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build and package (compile, jar, module archives, release archive)
+        # distArchive/checkPackage are in the default run on purpose: the release
+        # workflow only exercises them when a tag is pushed, so a packaging regression
+        # would otherwise sit there until somebody cut a release over it.
+        run: ./gradlew --no-daemon build distArchive checkPackage
+
+      - name: Smoke test${{ matrix.os == 'macos-latest' && ' (informational)' || '' }}
+        id: smoke
+        # Linux gets a private Xvfb display; macOS/Windows use the runner's own
+        # window session. The harness itself refuses to run on DISPLAY=:0/:1.
+        #
+        # Diagnostics: a GUI boot failure is invisible in a stack trace that never
+        # got printed, and job logs require a token to fetch, so the harness's own
+        # verdict is copied into the log, the step summary, and an ::error::
+        # annotation (annotations are readable through the public API).
+        #
+        # macOS is informational, because the app does not start there on a current
+        # JDK for reasons that predate this build. All three are confirmed from the
+        # harness's own start-up exception capture rather than guessed:
+        #   - ch.randelshofer.quaqua.util.BinaryPListParser: "parseInt: unsupported
+        #     byte count:16". Quaqua 3.x cannot read a modern property list, and it is
+        #     the look-and-feel Alchemy selects on macOS (Alchemy.java, "OS == OS_MAC").
+        #   - OSXAdapter reaches com.apple.eawt reflectively; java.desktop does not
+        #     export that package to the unnamed module, so About/Quit never register.
+        #   - the failed lookup leaves OSXAdapter.macOSXApplication null, and the next
+        #     call on it raises a NullPointerException.
+        # Quaqua also calls Container.getPeer(), unreachable since JDK 10, and
+        # AlcWindow.resizeWindow dereferences Alchemy.toolBar before start-up has set
+        # it. Running the assertions anyway publishes that diagnosis on every push
+        # without letting a platform that has been broken as long as this code exists
+        # redden the build. Note this makes macOS *runtime* state non-blocking only:
+        # the compile/package steps above still gate macOS. Set continue-on-error to
+        # false when the macOS platform work lands (MAINTENANCE.md open question 2).
+        continue-on-error: ${{ matrix.os == 'macos-latest' }}
+        env:
+          MARKER: build/dist/smoke-result.txt
+        run: |
+          set +e
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a --server-args="-screen 0 1280x800x24" ./gradlew --no-daemon smokeTest
+          else
+            ./gradlew --no-daemon smokeTest
+          fi
+          status=$?
+
+          # Unconditional, and in the step log as well as the summary: annotations have
+          # been observed to go missing for a failing job, and a GUI smoke test that
+          # fails with no verdict visible anywhere is the worst case for whoever is next.
+          echo "---- smoke-result.txt ----"
+          cat "$MARKER" 2>/dev/null || echo "(missing: harness died before writing results)"
+          echo "------------------------------"
+
+          {
+            echo "## smoke-result.txt"
+            echo '```'
+            cat "$MARKER" 2>/dev/null || echo "(missing: harness died before writing results)"
+            echo '```'
+            echo "## application log (tail)"
+            echo '```'
+            tail -n 50 build/dist/log/alchemy.txt 2>/dev/null || echo "(no application log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$status" -ne 0 ]; then
+            reason=$(tr '\n' ' ' 2>/dev/null < "$MARKER")
+            reason=${reason//%/}
+            : "${reason:=no marker file - harness exited $status before writing results}"
+            echo "::error::smoke failed (${{ matrix.os }}, JDK ${{ matrix.jdk }}): $reason"
+            if [ "${{ matrix.os }}" = "macos-latest" ]; then
+              echo "::warning::macOS runtime is informational and does not gate this build: the 2018 Quaqua look-and-feel and the com.apple.eawt glue do not work on a current JDK. See the comment on this step and MAINTENANCE.md."
+            fi
+            exit "$status"
+          fi
+
+      # `failure()` skips steps whose failure was tolerated, so key off this step's
+      # own outcome instead - a tolerated macOS failure still gets its evidence kept.
+      # The unpacked Linux package is launched here, and only here: Windows and macOS
+      # runtimes are red for pre-existing reasons, and their structural gate ran above.
+      - name: Verify the packed archive really runs (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a --server-args="-screen 0 1280x800x24" ./gradlew --no-daemon verifyDist
+
+      - name: Upload smoke evidence
+        if: always() && steps.smoke.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-${{ matrix.os }}-jdk${{ matrix.jdk }}
+          path: |
+            build/dist/smoke-result.txt
+            build/dist/log/alchemy.txt
+          if-no-files-found: ignore
+          retention-days: 14

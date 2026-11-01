@@ -1,0 +1,24 @@
+# Line-ending policy. The tree was normalised to LF in 2026; without this, a
+# contributor on Windows silently reintroduces CRLF into every file they touch.
+* text=auto eol=lf
+
+# Windows batch files are run by cmd.exe, which needs CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never let the line-ending machinery touch a binary.
+*.jar binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.so binary
+*.dll binary
+*.jnilib binary
+*.dylib binary
+*.ttf binary
+AlcNative binary

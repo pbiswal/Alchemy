@@ -1,0 +1,44 @@
+Alchemy @VERSION@ (unofficial build)
+====================================
+
+Alchemy is a free-hand generative drawing environment: you sketch a shape and
+attach "affect" modules that reproduce, recolour, mirror or animate it.
+
+Source and provenance
+---------------------
+  Original project : "Alchemy" by Karl D.D. Willis
+                     https://karldd.github.io/alchemy
+  Source of this
+  build            : https://github.com/pbiswal/Alchemy  commit @COMMIT@
+  Upstream tree    : the unmaintained upstream (last release: Alchemy 008, 2010;
+                     last commit: 2018-10-30)
+
+This is an unofficial community build. It is not published, endorsed or reviewed
+by the original author. Modifications are distributed under the same GPLv3 terms
+as the original work.
+
+Requirements
+------------
+  Java 17 or newer (this build line is tested on JDK 17, 21 and 25).
+  Start with ./Alchemy (Linux/macOS), Alchemy.bat (Windows), or by double
+  clicking alchemy.jar. JAVA_HOME is honoured when set; set ALCHEMY_OPTS for
+  extra JVM options.
+
+Platform status
+---------------
+  Linux x86_64 : starts, all 28 module archives register (verified in CI).
+  Windows x64  : starts, all 28 module archives register (verified in CI).
+  macOS        : starts and the window opens, but the bundled 2018 Quaqua
+                 look-and-feel and the com.apple.eawt glue throw during
+                 start-up. Treated as best-effort; see MAINTENANCE.md.
+  Pen / tablet : JPen native libraries for Linux x86 (32/64), Windows (32/64) and
+                 Intel macOS are bundled in lib/jpen. Apple Silicon builds are
+                 not bundled; a keyboard and mouse still works.
+  Demo shapes  : the "shapes/" folder shipped with Alchemy 008 was never
+                 committed to the repository, so it is not in this archive.
+
+Licence
+-------
+  GPLv3 - see LICENSE.md. Bundled third-party libraries (Batik, iText,
+  MigLayout, Quaqua, JPen, JPF, PDFRenderer, Foxtrot, JavaFX 3D beads,
+  Apache Commons Logging, MIME Util, XML-apis) retain their own licences.

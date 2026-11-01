@@ -186,7 +186,19 @@ public class AlcWindow extends JFrame implements AlcConstants, WindowStateListen
         this.setSize(Math.max(minWindowSize.width, this.getWidth()), Math.max(minWindowSize.height, this.getHeight()));
         // Get and set the new size of the window
         windowSize = this.getSize();
-        // Resize the UI and Canvas
+        // Resize the UI and Canvas.
+        //
+        // Both are created after this window in Alchemy.startUp, and this window registers
+        // itself as its own component listener in its constructor, so a resize delivered
+        // while the frame peer is being created reaches this method before they exist. The
+        // Windows peer does exactly that, which is why the same code is a null dereference
+        // there and not on Linux or macOS. Nothing has been laid out yet at that point, so
+        // skipping is the correct response to the event, not a way of hiding a fault: the
+        // window is resized again once it is shown. The pair is tested together because
+        // resizeCanvas reads the toolbar width in simple-toolbar mode.
+        if (Alchemy.toolBar == null || Alchemy.canvas == null) {
+            return;
+        }
         Alchemy.toolBar.resizeToolBar(windowSize);
         Alchemy.canvas.resizeCanvas(windowSize);
     }
