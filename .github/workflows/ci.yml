@@ -46,34 +46,62 @@ jobs:
         # current JDK the source is expected to keep building on.
         jdk: [17, 21, 25]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK ${{ matrix.jdk }}
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: ${{ matrix.jdk }}
 
       # Caches the wrapper distribution and dependency lookups, and validates the
       # committed gradle-wrapper.jar against the known-good checksum list.
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
 
       - name: Build (compile, jar, package module archives)
         run: ./gradlew --no-daemon build
 
-      - name: Smoke test (Xvfb)
-        if: runner.os == 'Linux'
-        # -a allocates a private display; the harness refuses to run on :0/:1 so a
-        # misconfigured runner cannot test against somebody's real desktop.
-        run: xvfb-run -a --server-args="-screen 0 1280x800x24" ./gradlew --no-daemon smokeTest
+      - name: Smoke test
+        # Linux gets a private Xvfb display; macOS/Windows use the runner's own
+        # window session. The harness itself refuses to run on DISPLAY=:0/:1.
+        #
+        # Diagnostics: a GUI boot failure is invisible in a stack trace that never
+        # got printed, and job logs require a token to fetch, so the harness's own
+        # verdict is copied into the log, the step summary, and an ::error::
+        # annotation (annotations are readable through the public API).
+        env:
+          MARKER: build/dist/smoke-result.txt
+        run: |
+          set +e
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a --server-args="-screen 0 1280x800x24" ./gradlew --no-daemon smokeTest
+          else
+            ./gradlew --no-daemon smokeTest
+          fi
+          status=$?
 
-      - name: Smoke test (native window session)
-        if: runner.os != 'Linux'
-        run: ./gradlew --no-daemon smokeTest
+          {
+            echo "## smoke-result.txt"
+            echo '```'
+            cat "$MARKER" 2>/dev/null || echo "(missing: harness died before writing results)"
+            echo '```'
+            echo "## application log (tail)"
+            echo '```'
+            tail -n 50 build/dist/log/alchemy.txt 2>/dev/null || echo "(no application log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$status" -ne 0 ]; then
+            reason=$(tr '\n' ' ' 2>/dev/null < "$MARKER")
+            reason=${reason//%/}
+            : "${reason:=no marker file - harness exited $status before writing results}"
+            echo "::error::smoke failed (${{ matrix.os }}, JDK ${{ matrix.jdk }}): $reason"
+            exit "$status"
+          fi
 
       - name: Upload smoke evidence
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: smoke-${{ matrix.os }}-jdk${{ matrix.jdk }}
           path: |
