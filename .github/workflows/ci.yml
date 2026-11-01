@@ -59,8 +59,11 @@ jobs:
       # committed gradle-wrapper.jar against the known-good checksum list.
       - uses: gradle/actions/setup-gradle@v6
 
-      - name: Build (compile, jar, package module archives)
-        run: ./gradlew --no-daemon build
+      - name: Build and package (compile, jar, module archives, release archive)
+        # distArchive/checkPackage are in the default run on purpose: the release
+        # workflow only exercises them when a tag is pushed, so a packaging regression
+        # would otherwise sit there until somebody cut a release over it.
+        run: ./gradlew --no-daemon build distArchive checkPackage
 
       - name: Smoke test${{ matrix.os == 'macos-latest' && ' (informational)' || '' }}
         id: smoke
@@ -132,6 +135,12 @@ jobs:
 
       # `failure()` skips steps whose failure was tolerated, so key off this step's
       # own outcome instead - a tolerated macOS failure still gets its evidence kept.
+      # The unpacked Linux package is launched here, and only here: Windows and macOS
+      # runtimes are red for pre-existing reasons, and their structural gate ran above.
+      - name: Verify the packed archive really runs (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a --server-args="-screen 0 1280x800x24" ./gradlew --no-daemon verifyDist
+
       - name: Upload smoke evidence
         if: always() && steps.smoke.outcome == 'failure'
         uses: actions/upload-artifact@v7
