@@ -11,7 +11,9 @@
  *   ./gradlew run          launch Alchemy against the staged distribution
  *   ./gradlew smokeTest    launch headlessly (use xvfb-run on Linux), verify all
  *                          modules register, render the window, write PNG evidence
- *   ./gradlew dist         staged distribution: build/dist/{modules,lib}
+ *   ./gradlew dist         staged distribution: build/dist/{alchemy.jar,lib,modules}
+ *   ./gradlew distArchive  build/distributions/{tar.gz,zip,SHA256SUMS.txt}
+ *   ./gradlew verifyDist   unpack distArchive and run it through its own launcher
  *   ./gradlew harnessTest  test the smoke harness's own log parsing (no display)
  *
  * Workstream 1 of MAINTENANCE.md. Keep this file dependency-light: the third
@@ -22,11 +24,11 @@
  * LICENSE.md.
  */
 plugins {
-    id 'application'
+    id 'java'
 }
 
 group = 'org.alchemy'
-version = providers.gradleProperty('alchemyVersion').getOrElse('0.0.9-dev')
+version = providers.gradleProperty('alchemyVersion').getOrElse('0.9.0')
 
 /*
  * Language/API baseline. `--release` means the build runs on any JDK >= 17 while
@@ -42,10 +44,16 @@ def javaBaseline = 17
  */
 def sourceEncoding = 'ISO-8859-1'
 
-application {
-    mainClass = 'org.alchemy.core.Alchemy'
-    applicationName = 'Alchemy'
-}
+/*
+ * Only the java plugin is applied, deliberately not `application`. That plugin contributes
+ * startScripts/installDist/distTar/distZip which produced a distribution this project
+ * cannot use - scripts without java.library.path, and archives without the module zips - so
+ * `./gradlew tasks` advertised four ways of packaging Alchemy while all four were subtly
+ * wrong and only :dist actually ran. :dist plus :distArchive are now the single answer, and
+ * every start script in the repository is one reviewed file (packaging/Alchemy.sh) instead
+ * of a generated template.
+ */
+def mainClassName = 'org.alchemy.core.Alchemy'
 
 sourceSets {
     main {
@@ -92,14 +100,6 @@ dependencies {
     implementation files(fileTree(dir: 'lib', include: ['**/*.jar'], excludes: ['ant/**', 'jpen/jpen-tiger/**']))
 }
 
-/*
- * The application plugin's tar/zip assembly is not the Alchemy distribution -
- * `dist` below stages the layout the app actually expects (./modules, ./lib).
- */
-tasks.matching { it.name == 'distTar' || it.name == 'distZip' }.configureEach {
-    enabled = false
-}
-
 tasks.withType(JavaCompile).configureEach {
     options.release = javaBaseline
     options.encoding = sourceEncoding
@@ -115,17 +115,43 @@ tasks.withType(AbstractArchiveTask).configureEach {
     reproducibleFileOrder = true
 }
 
+/*
+ * What makes the jar runnable outside Gradle. Up to 2026 the only documented way of
+ * launching a source build was the IDE, and an IDE puts the dependencies on the command
+ * line itself, so nothing noticed that the jar could not start on its own:
+ * "java -jar build/libs/alchemy.jar" died with NoClassDefFoundError:
+ * jpen/event/PenListener. "Does the artifact run?" is a different question from "does
+ * the code compile?", and only :verifyDist can answer it.
+ *
+ * The jar stays thin on purpose: repackaging the GPL binary dependencies into one fat
+ * jar would make licence provenance harder to trace for no user benefit.
+ */
+def manifestClassPath = providers.provider {
+    // Resolved at execution time: a configuration must not be resolved while the build
+    // script is being configured.
+    def names = configurations.runtimeClasspath.files.collect { it.name }.sort()
+    def awkward = names.findAll { it.contains(' ') || it.contains('%') }
+    if (!awkward.isEmpty()) {
+        throw new GradleException("Class-Path is space separated and URI encoded, so " +
+                "${awkward} cannot be referenced from a manifest. Rename the jar(s).")
+    }
+    names.collect { "lib/${it}" }.join(' ')
+}
+
 tasks.named('jar', Jar) {
+    // Unversioned so the launcher, the manifest and "java -jar alchemy.jar" all agree
+    // about one name, and so re-packing never requires editing a start script.
+    archiveFileName = 'alchemy.jar'
     manifest {
         attributes(
-                'Main-Class': application.mainClass,
+                'Main-Class': mainClassName,
                 'Implementation-Title': 'Alchemy',
                 'Implementation-Version': project.version,
-                // JPF loads module classes from its own URLs classloader; the
-                // app classpath stays the single source of truth for 3rd party
-                // libraries, so the jar needs no Class-Path of its own.
                 'Build-Jdk-Spec': javaBaseline
         )
+    }
+    doFirst {
+        manifest.attributes 'Class-Path': manifestClassPath.get()
     }
 }
 
@@ -191,23 +217,108 @@ tasks.register('moduleZips') {
  */
 def distDir = layout.buildDirectory.dir('dist')
 
+/*
+ * Provenance has to be generated to be true. A hand-edited "built from commit X" line in
+ * a release notes file is wrong in exactly the releases where it matters, so NOTICE.txt -
+ * which ships inside the archive - is stamped by the build. It says plainly that this is
+ * an unofficial community build of an unmaintained upstream.
+ *
+ * The stamp runs git through ProcessBuilder inside the task, on the reasoning that a
+ * build-time side effect belongs to a task. It matters here: the first version read the
+ * stamp while configuring with Gradle's exec and a catch-all around it, and every package
+ * this session shipped said "commit unknown" - a provenance file that lies quietly is the
+ * worst kind. Reading git inside the task makes the stamp visible in the build log.
+ */
+def gitOutput = { File repo, List<String> args ->
+    def proc = new ProcessBuilder((['git'] + args)).directory(repo).start()
+    def out = proc.inputStream.getText('UTF-8')
+    proc.errorStream.getText('UTF-8')
+    if (!proc.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
+        proc.destroyForcibly()
+        throw new IllegalStateException("git ${args.join(' ')} timed out")
+    }
+    if (proc.exitValue() != 0) {
+        throw new IllegalStateException("git ${args.join(' ')} exited ${proc.exitValue()}")
+    }
+    return out.trim()
+}
+
+def noticeFile = tasks.register('noticeFile') {
+    group = 'alchemy'
+    description = 'Generate NOTICE.txt (provenance and known limitations of this build)'
+    def template = file('packaging/NOTICE.template')
+    def target = layout.buildDirectory.file('notice/NOTICE.txt')
+    inputs.file template
+    inputs.property 'version', project.version.toString()
+    outputs.file target
+    // Provenance is read from git on every run. It cannot be a declared input without
+    // reading it while configuring, and Gradle 9 reports exec at configuration time as a
+    // problem - so the task simply never claims to be up to date rather than shipping a
+    // NOTICE.txt that names the commit of some earlier build.
+    outputs.upToDateWhen { false }
+    doLast {
+        String commit
+        try {
+            def sha = gitOutput(rootDir, ['rev-parse', '--short', 'HEAD'])
+            commit = gitOutput(rootDir, ['status', '--porcelain']) ? "${sha} (dirty working tree)" : sha
+        } catch (Exception ignored) {
+            // Building from a source tarball: no git, no provenance, no failure.
+            commit = 'unknown (source was not a git checkout)'
+        }
+        // Tokens, not expand(): expand() runs a template engine over the file, so a
+        // stray "$" in prose would become a build failure.
+        target.get().asFile.text = template.getText('UTF-8')
+                .replace('@VERSION@', project.version.toString())
+                .replace('@COMMIT@', commit)
+        logger.lifecycle "NOTICE.txt stamped with commit ${commit}"
+    }
+}
+
+/** Top-level directory name inside the release archives. */
+def distName = "alchemy-${project.version}"
+def isWindows = org.gradle.internal.os.OperatingSystem.current().isWindows()
+
 def stageDist = tasks.register('dist', Sync) {
     group = 'alchemy'
-    description = 'Stage a runnable distribution in build/dist (module archives + native JPen library)'
-    dependsOn jar, moduleZips
+    description = 'Stage a runnable distribution in build/dist (jar + dependency jars + module archives)'
+    dependsOn jar, moduleZips, noticeFile
     into distDir
 
     from(moduleArchives) {
         into 'modules'
     }
     from(jar) {
-        into 'app'
+        rename { 'alchemy.jar' }
     }
-    // JPen's loader looks for its JNI library on java.library.path; keep the
-    // packaged layout self-contained.
+    // The manifest's Class-Path says "lib/<name>", so the dependency jars have to be
+    // copied flat into lib/ with their original names. FAIL rather than EXCLUDE: two
+    // vendored jars sharing a name would otherwise be resolved by whichever Gradle
+    // happened to iterate first.
+    from(configurations.runtimeClasspath) {
+        into 'lib'
+        duplicatesStrategy = DuplicatesStrategy.FAIL
+    }
+    // JPen's loader looks for its JNI library on java.library.path; keep the packaged
+    // layout self-contained.
     from('lib/jpen') {
         into 'lib/jpen'
-        include '*.so', '*.dylib', '*.dll'
+        include '*.so', '*.dylib', '*.dll', '*.jnilib'
+    }
+    from('packaging/Alchemy.sh') {
+        rename { 'Alchemy' }
+    }
+    from('packaging/Alchemy.bat')
+    from(noticeFile)
+    from('LICENSE.md')
+    from('README.md')
+
+    eachFile { details ->
+        // A non-executable ./Alchemy in a tarball is the classic self-inflicted release
+        // bug. Gradle 9 sets modes through an action on ConfigurableFilePermissions;
+        // `details.permissions.unix(...)` looks right but hits the read-only view.
+        details.permissions { perms ->
+            perms.unix(details.name == 'Alchemy' ? 0755 : 0644)
+        }
     }
 }
 
@@ -227,12 +338,185 @@ ext.applicationJvmArgs = {
     return args
 }
 
-tasks.named('run', JavaExec) {
+tasks.register('run', JavaExec) {
     description = 'Launch Alchemy from the staged distribution in build/dist'
     dependsOn stageDist
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = mainClassName
     workingDir = distDir.get().asFile
     systemProperty 'java.library.path', file('lib/jpen').absolutePath
     jvmArgs applicationJvmArgs()
+}
+
+/* -------------------------------------------------------------- release media */
+
+/*
+ * The publishable archives. build/dist doubles as the working directory of :run and
+ * :smokeTest, so it accumulates log/ and smoke-result.txt; the archives therefore name
+ * exactly what may ship instead of excluding what may not. Nothing can leak into a
+ * release by being forgotten.
+ */
+def releaseIncludes = ['Alchemy', 'Alchemy.bat', 'alchemy.jar', 'NOTICE.txt',
+                       'LICENSE.md', 'README.md', 'lib/**', 'modules/**']
+
+/*
+ * CI builds one package per platform. Without a classifier all three are named
+ * alchemy-<version>-unofficial.tar.gz and cannot be staged side by side, so the
+ * release workflow passes -PdistClassifier=linux|windows|macos. Local builds leave it
+ * empty and keep the short name.
+ */
+def distClassifier = providers.gradleProperty('distClassifier').getOrElse('')
+def distBaseName = distClassifier ? "${distName}-unofficial-${distClassifier}" : "${distName}-unofficial"
+
+def distTar = tasks.register('distTar', Tar) {
+    description = 'Pack the distribution as a .tar.gz'
+    dependsOn stageDist
+    from(stageDist)
+    into distName
+    include releaseIncludes
+    // The mode on the staged file is what tar records; restate it so an archive built
+    // from a working tree on a FAT-mounted volume still carries the launcher bit.
+    eachFile { details ->
+        details.permissions { perms -> perms.unix(details.name == 'Alchemy' ? 0755 : 0644) }
+    }
+    archiveFileName = "${distBaseName}.tar.gz"
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+    compression = Compression.GZIP
+}
+
+def distZip = tasks.register('distZip', Zip) {
+    description = 'Pack the distribution as a .zip'
+    dependsOn stageDist
+    from(stageDist)
+    into distName
+    include releaseIncludes
+    eachFile { details ->
+        details.permissions { perms -> perms.unix(details.name == 'Alchemy' ? 0755 : 0644) }
+    }
+    archiveFileName = "${distBaseName}.zip"
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+}
+
+def distChecksums = tasks.register('distChecksums') {
+    description = 'Write SHA256SUMS.txt next to the release archives'
+    dependsOn distTar, distZip
+    def sums = layout.buildDirectory.file('distributions/SHA256SUMS.txt')
+    inputs.files distTar, distZip
+    outputs.file sums
+    doLast {
+        def digest = java.security.MessageDigest.getInstance('SHA-256')
+        def lines = inputs.files.files.sort { it.name }.collect {
+            digest.reset()
+            def bytes = it.bytes
+            "${digest.digest(bytes).collect { String.format('%02x', it) }.join('')}  ${it.name}"
+        }
+        sums.get().asFile.text = lines.join('\n') + '\n'
+        logger.lifecycle "Checksums: ${lines.join(' ')}"
+    }
+}
+
+def distArchive = tasks.register('distArchive') {
+    group = 'alchemy'
+    description = 'Build the release archives and their checksums into build/distributions'
+    dependsOn distTar, distZip, distChecksums
+}
+
+/* --------------------------------------------------------- distribution tests */
+
+/*
+ * Unpack what was actually packed, into a directory nothing else writes to. Reading
+ * from build/dist instead would test the staging, not the archive, and an archive that
+ * is missing a file is a release-day bug nobody sees until a user reports it.
+ */
+def packagedRoot = new File(layout.buildDirectory.asFile.get(), 'verify-package')
+def packagedDir = new File(packagedRoot, distName)
+
+def unpackDist = tasks.register('unpackDist', Sync) {
+    group = 'verification'
+    description = 'Unpack the release archive into build/verify-package'
+    dependsOn(isWindows ? distZip : distTar)
+    from(isWindows ? zipTree(distZip.flatMap { it.archiveFile })
+                    : tarTree(distTar.flatMap { it.archiveFile }))
+    into packagedRoot
+}
+def checkPackage = tasks.register('checkPackage') {
+    group = 'verification'
+    description = 'Assert the packed distribution is complete and self-describing'
+    dependsOn unpackDist
+    doLast {
+        def root = packagedDir
+        def appJar = new File(root, 'alchemy.jar')
+        if (!appJar.isFile()) {
+            throw new GradleException("${appJar} missing from the unpacked archive.")
+        }
+        def jar = new java.util.jar.JarFile(appJar)
+        try {
+            def manifest = jar.manifest
+            def mainClass = manifest?.getMainAttributes()?.getValue('Main-Class')
+            if (!mainClass) {
+                throw new GradleException("${appJar} has no Main-Class: double-clicking it cannot work.")
+            }
+            def entries = (manifest.getMainAttributes().getValue('Class-Path') ?: '').split(' ').findAll { it }
+            def missing = entries.findAll { !new File(root, it).isFile() }
+            if (!entries || missing) {
+                throw new GradleException("Class-Path is ${entries.size()} entries, ${missing.size()} " +
+                        "not in the archive: ${missing.take(5)}. A jar packaged this way throws " +
+                        "NoClassDefFoundError on the user's machine.")
+            }
+            def archives = new File(root, 'modules').listFiles()?.findAll { it.name.endsWith('.zip') } ?: []
+            def expected = moduleSourceDirs().size()
+            if (archives.size() != expected) {
+                throw new GradleException("${archives.size()} module archives in the package, " +
+                        "${expected} under modules/. The distribution is incomplete.")
+            }
+            def launcher = new File(root, isWindows ? 'Alchemy.bat' : 'Alchemy')
+            if (!launcher.isFile()) {
+                throw new GradleException("${launcher} missing from the archive.")
+            }
+            if (!isWindows && !launcher.canExecute()) {
+                throw new GradleException("${launcher} is not executable in the unpacked archive.")
+            }
+            if (!new File(root, 'NOTICE.txt').isFile()) {
+                throw new GradleException("NOTICE.txt missing: a release must state what it is.")
+            }
+            if (new File(root, 'NOTICE.txt').text =~ /@(VERSION|COMMIT)@/) {
+                throw new GradleException('NOTICE.txt still holds an unsubstituted template token.')
+            }
+            // build/dist doubles as the working directory of run/smokeTest, so it
+            // accumulates log/ and result files. A release must not carry them.
+            ['build', 'src', 'log'].each { banned ->
+                if (new File(root, banned).exists()) {
+                    throw new GradleException("${banned}/ leaked into the release archive.")
+                }
+            }
+            def strays = []
+            root.eachFileRecurse { if (it.name.endsWith('.class')) strays << it.name }
+            if (strays) {
+                throw new GradleException("Loose class files in the archive: ${strays.take(3)}")
+            }
+            if (!new File(root, 'README.md').isFile() || !new File(root, 'LICENSE.md').isFile()) {
+                throw new GradleException('README.md or LICENSE.md missing from the archive.')
+            }
+            logger.lifecycle "Package check: Main-Class=${mainClass}, " +
+                    "classpath_entries=${entries.size()}, module_archives=${archives.size()}, launcher=${launcher.name}"
+        } finally {
+            jar.close()
+        }
+    }
+}
+
+def verifyDist = tasks.register('verifyDist', JavaExec) {
+    group = 'verification'
+    description = 'Run the unpacked release archive through its own launcher and assert every module started'
+    dependsOn checkPackage
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'org.alchemy.harness.ArtifactSmokeTest'
+    workingDir = packagedDir
+    args packagedDir,
+            providers.gradleProperty('artifactTimeout').getOrElse('180'),
+            String.valueOf(moduleSourceDirs().size())
+    systemProperty 'alchemy.artifact.result',
+            new File(layout.buildDirectory.asFile.get(), 'artifact-result.txt').absolutePath
 }
 
 /* --------------------------------------------------------------- smoke test */

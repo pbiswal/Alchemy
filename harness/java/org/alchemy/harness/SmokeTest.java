@@ -54,8 +54,12 @@ public final class SmokeTest {
     /**
      * Exception traces that are known and non-fatal at start-up today. Keep this
      * list short and explicit; it is the regression budget for start-up errors.
+     *
+     * <p>Package private on purpose: {@link ArtifactSmokeTest} judges the same product
+     * by the same standard, so a trace can never be forgiven in one harness and fail in
+     * the other.
      */
-    private static final String[] ALLOWED_EXCEPTIONS = {
+    static final String[] ALLOWED_EXCEPTIONS = {
         // JPen tablet back-end probes for native libraries at start-up.
         "jpen",
         // Optional native helper (no source in repo; the app runs without it).
