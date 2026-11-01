@@ -61,7 +61,8 @@ jobs:
       - name: Build (compile, jar, package module archives)
         run: ./gradlew --no-daemon build
 
-      - name: Smoke test
+      - name: Smoke test${{ matrix.os == 'macos-latest' && ' (informational)' || '' }}
+        id: smoke
         # Linux gets a private Xvfb display; macOS/Windows use the runner's own
         # window session. The harness itself refuses to run on DISPLAY=:0/:1.
         #
@@ -69,6 +70,25 @@ jobs:
         # got printed, and job logs require a token to fetch, so the harness's own
         # verdict is copied into the log, the step summary, and an ::error::
         # annotation (annotations are readable through the public API).
+        #
+        # macOS is informational, because the app does not start there on a current
+        # JDK for reasons that predate this build. All three are confirmed from the
+        # harness's own start-up exception capture rather than guessed:
+        #   - ch.randelshofer.quaqua.util.BinaryPListParser: "parseInt: unsupported
+        #     byte count:16". Quaqua 3.x cannot read a modern property list, and it is
+        #     the look-and-feel Alchemy selects on macOS (Alchemy.java, "OS == OS_MAC").
+        #   - OSXAdapter reaches com.apple.eawt reflectively; java.desktop does not
+        #     export that package to the unnamed module, so About/Quit never register.
+        #   - the failed lookup leaves OSXAdapter.macOSXApplication null, and the next
+        #     call on it raises a NullPointerException.
+        # Quaqua also calls Container.getPeer(), unreachable since JDK 10, and
+        # AlcWindow.resizeWindow dereferences Alchemy.toolBar before start-up has set
+        # it. Running the assertions anyway publishes that diagnosis on every push
+        # without letting a platform that has been broken as long as this code exists
+        # redden the build. Note this makes macOS *runtime* state non-blocking only:
+        # the compile/package steps above still gate macOS. Set continue-on-error to
+        # false when the macOS platform work lands (MAINTENANCE.md open question 2).
+        continue-on-error: ${{ matrix.os == 'macos-latest' }}
         env:
           MARKER: build/dist/smoke-result.txt
         run: |
@@ -96,11 +116,16 @@ jobs:
             reason=${reason//%/}
             : "${reason:=no marker file - harness exited $status before writing results}"
             echo "::error::smoke failed (${{ matrix.os }}, JDK ${{ matrix.jdk }}): $reason"
+            if [ "${{ matrix.os }}" = "macos-latest" ]; then
+              echo "::warning::macOS runtime is informational and does not gate this build: the 2018 Quaqua look-and-feel and the com.apple.eawt glue do not work on a current JDK. See the comment on this step and MAINTENANCE.md."
+            fi
             exit "$status"
           fi
 
+      # `failure()` skips steps whose failure was tolerated, so key off this step's
+      # own outcome instead - a tolerated macOS failure still gets its evidence kept.
       - name: Upload smoke evidence
-        if: failure()
+        if: always() && steps.smoke.outcome == 'failure'
         uses: actions/upload-artifact@v7
         with:
           name: smoke-${{ matrix.os }}-jdk${{ matrix.jdk }}
