@@ -1,0 +1,24 @@
+# Gradle output
+/.gradle/
+/build/
+
+# Legacy NetBeans / Ant output
+/nbproject/private/
+/dist/
+/bin/
+
+# Runtime log written by the app (relative to the working directory)
+/log/
+
+# Smoke-test evidence
+smoke-*.png
+
+# Ant/Profiler artefacts
+*.class
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+

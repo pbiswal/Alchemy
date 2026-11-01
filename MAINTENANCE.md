@@ -41,29 +41,39 @@ everything else.
 Goal: `git clone && <one command>` produces a runnable Alchemy with loadable modules,
 and CI proves it on every push.
 
-- [ ] Decide toolchain: **Gradle (recommended)** vs a standalone Ant script that drops
-      the NetBeans `nbproject/build-impl.xml` import, `ant-contrib` and `jarbundler`.
-- [ ] Raise `source`/`target` from `1.5` to `8` first (minimum churn), then evaluate `17`.
-- [ ] Replace the custom `jpf-zip` Ant task with an equivalent packaging step so
-      `modules/*.zip` are produced from `src/` + `modules/*/plugin.xml`.
-- [ ] Keep `modules/` and `lib/` next to the launchable jar (runtime assumption), and
-      make the launchable task set the working directory accordingly — plugin discovery
-      uses the cwd-relative `new File("modules")` in `AlcPlugins`.
+- [x] Toolchain: **Gradle** (wrapper committed) - chosen over a standalone Ant script, so
+      no `nbproject/build-impl.xml` import, `ant-contrib` or `jarbundler` is needed.
+- [x] Raise `source`/`target` from `1.5` to `17` (`--release 17`). All 91 files compile
+      with only deprecation/unchecked notes; no intermediate `8` step was needed.
+- [x] Replace the custom `jpf-zip` Ant task with a Gradle packaging step that reads each
+      `modules/*/plugin.xml` and emits `build/modules/<id>-<version>.zip` (28 archives).
+- [x] `dist` task stages `modules/`, the app jar and `lib/jpen` natives together, and `run`
+      / `smokeTest` set `workingDir` to that layout - plugin discovery uses the
+      cwd-relative `new File("modules")` in `AlcPlugins`.
 - [ ] Move replaceable deps to Maven Central: Batik, MigLayout, commons-logging,
       XMLCommons/`xml-apis`. Keep vendored: JPF 1.5.1, JPen (+ natives), Quaqua, Foxtrot.
 - [ ] Evaluate `lib/itext.jar` (unlabelled vintage) against OpenPDF before touching
       PDF export; PDF export is a user-visible feature, do not change behaviour here.
 - [ ] Delete the developer-local leftover in `nbproject/project.properties`:
       `file.reference.foxtrot.jar-1=../../../../Sony/Exhibition Workshop/...`
-- [ ] Add a `run` task and a `smokeTest` task that boots the app under Xvfb and fails on
-      any exception on stderr (the current manual proof method).
+- [x] `run` and `smokeTest` tasks exist. `smokeTest` boots the real app under a private
+      X display and asserts: no fatal start-up error, window/canvas sized, menu bar and
+      tool bar populated (48 menu items, 18 tool buttons), 28 archives -> 27 plugins
+      (16 create + 11 affect), and no unexpected exception trace on stdout/stderr.
 - [ ] Add GitHub Actions matrix: ubuntu / macos / windows x JDK 17 / 21 / 25,
-      jobs = compile + smoke launch. No deploy.
+      jobs = `./gradlew build smokeTest` (Xvfb on Linux). No deploy.
 - [ ] Keep NetBeans project files working (or state explicitly in README that they are
       retired) - do not leave a half-supported second build path.
 
-**Acceptance:** a clean clone builds and boots on a machine with only a JDK installed;
-CI green on Linux/macOS/Windows.
+**Rule for any future UI test:** never grab the screen (`Robot.createScreenCapture`,
+`import -window root`, etc.). A grab reads whatever display the process is on, so it can
+"pass" against an unrelated desktop, and on a desktop session with a screenshots portal it
+prompts the user for remote-desktop consent. `SmokeTest` refuses to run on display `:0`/`:1`
+for this reason; assert on component/structure state, or render the drawing model off-screen.
+
+**Acceptance:** a clean clone builds and boots with `./gradlew build smokeTest` on a machine
+with only a JDK installed (verified: clean build -> 28 module archives -> smoke PASS, 0
+exception traces); CI green on Linux/macOS/Windows.
 
 ---
 
@@ -79,7 +89,9 @@ or a human staring at a window.
 - [ ] Document the module contract (lifecycle `setup/cleared/reselect/deselect/commited`,
       input callbacks) in `modules/README.md` with a "build and run in 3 commands" section.
 - [ ] Add a headless test harness: drive `AlcCanvas` with synthetic mouse/pen events and
-      assert on shape counts and pixel diffs of the rendered canvas.
+      assert on shape counts and on the drawing model rendered off-screen (the canvas
+      paints to its own back buffer while showing, so pixel checks must render the model,
+      not photograph the window).
 - [ ] Add regression tests for the known-bad paths recorded as TODOs:
       `affect/ShapeSwap` ("General Path is not Serialised"), `affect/Blindness`
       ("autoreveal bug"), `create/PullShapes` ("Bug test this"),

@@ -1,0 +1,261 @@
+/*
+ * Alchemy build.
+ *
+ * Replaces the NetBeans/Ant pipeline (build.xml + nbproject/), which cannot run
+ * any more: it pins source/target compatibility to Java 1.5, which every JDK 12+
+ * rejects, and it generated its project files. The legacy files are kept for
+ * reference only - do not use them to build.
+ *
+ * Useful tasks:
+ *   ./gradlew build        compile + jar + package every module zip
+ *   ./gradlew run          launch Alchemy against the staged distribution
+ *   ./gradlew smokeTest    launch headlessly (use xvfb-run on Linux), verify all
+ *                          modules register, render the window, write PNG evidence
+ *   ./gradlew dist         staged distribution: build/dist/{modules,lib}
+ *
+ * Workstream 1 of MAINTENANCE.md. Keep this file dependency-light: the third
+ * party jars are still vendored in lib/ and moving them to Maven Central is a
+ * separate, reviewable change.
+ *
+ * Copyright (c) 2007-2010 Karl D.D. Willis. Licensed under the GPLv3 - see
+ * LICENSE.md.
+ */
+plugins {
+    id 'application'
+}
+
+group = 'org.alchemy'
+version = providers.gradleProperty('alchemyVersion').getOrElse('0.0.9-dev')
+
+/*
+ * Language/API baseline. `--release` means the build runs on any JDK >= 17 while
+ * still failing if newer JDK APIs are used, so a JDK 17 user can build exactly
+ * what a JDK 25 user builds. Raise this together with the README badge.
+ */
+def javaBaseline = 17
+
+/*
+ * The sources still contain Latin-1 bytes (see MAINTENANCE.md Workstream 3:
+ * normalise to UTF-8). Compiling them as UTF-8 today would silently corrupt the
+ * affected string literals, so the encoding stays as the legacy build declared.
+ */
+def sourceEncoding = 'ISO-8859-1'
+
+application {
+    mainClass = 'org.alchemy.core.Alchemy'
+    applicationName = 'Alchemy'
+}
+
+sourceSets {
+    main {
+        java.srcDirs = ['src']
+        resources {
+            // Resource files (PNGs, .properties, .html) sit next to the sources,
+            // which javac ignores; without this the app jar has no icons and no
+            // string bundle.
+            srcDirs = ['src']
+            exclude '**/*.java'
+        }
+    }
+    // Verification harness. Not shipped: it is never added to the application
+    // jar, only to the smokeTest classpath.
+    smoke {
+        java.srcDirs = ['harness/java']
+        resources.srcDirs = []
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+configurations {
+    smokeImplementation.extendsFrom implementation
+    smokeRuntimeOnly.extendsFrom runtimeOnly
+}
+
+repositories {
+    // Nothing is resolved from here yet - declared for the Maven Central
+    // migration that replaces the vendored jars.
+    mavenCentral()
+}
+
+dependencies {
+    /*
+     * Vendored third party jars: JPF 1.5.1 + its libs, Quaqua, Batik, iText,
+     * Foxtrot, JPen, MigLayout, Quaerite Prefs, the Alchemy OpenGL bindings.
+     * lib/ant holds the old Ant helper tasks and is deliberately excluded.
+     *
+     * lib/jpen/jpen-tiger/jpen-2.jar is a second, Java 5 era copy of the jar in
+     * lib/jpen; loading both means whichever sorts first wins, so only the
+     * current one is on the classpath.
+     */
+    implementation files(fileTree(dir: 'lib', include: ['**/*.jar'], excludes: ['ant/**', 'jpen/jpen-tiger/**']))
+}
+
+/*
+ * The application plugin's tar/zip assembly is not the Alchemy distribution -
+ * `dist` below stages the layout the app actually expects (./modules, ./lib).
+ */
+tasks.matching { it.name == 'distTar' || it.name == 'distZip' }.configureEach {
+    enabled = false
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = javaBaseline
+    options.encoding = sourceEncoding
+    // The codebase predates generics discipline; keep warnings visible without
+    // failing the build (see MAINTENANCE.md Workstream 3 for the cleanup plan).
+    options.compilerArgs += ['-Xlint:deprecation,unchecked']
+}
+
+tasks.withType(AbstractArchiveTask).configureEach {
+    // Reproducible archives: same inputs -> same bytes, so CI can cache and
+    // developers can diff what they are about to ship.
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+
+tasks.named('jar', Jar) {
+    manifest {
+        attributes(
+                'Main-Class': application.mainClass,
+                'Implementation-Title': 'Alchemy',
+                'Implementation-Version': project.version,
+                // JPF loads module classes from its own URLs classloader; the
+                // app classpath stays the single source of truth for 3rd party
+                // libraries, so the jar needs no Class-Path of its own.
+                'Build-Jdk-Spec': javaBaseline
+        )
+    }
+}
+
+/* ------------------------------------------------------------------ modules */
+
+/*
+ * A JPF module archive must be named "<plugin-id>-<version>.zip" - AlcPlugins
+ * looks for a file in ./modules whose name contains the plugin id and treats a
+ * missing match as a fatal error. The source folder names do not follow that
+ * convention, so the id/version are read from each plugin.xml.
+ *
+ * Module zips are build output. Never commit them: they are generated from the
+ * module sources, and committing built artefacts is how the 182 MB releases/
+ * directory happened.
+ */
+def moduleSourceDirs = {
+    def root = file('modules')
+    root.listFiles().findAll { it.isDirectory() && new File(it, 'plugin.xml').isFile() }.sort { it.name }
+}
+
+def moduleCoordinates = { File dir ->
+    def xml = new File(dir, 'plugin.xml').getText(sourceEncoding)
+    def matcher = xml =~ /<plugin\s+id="([^"]+)"\s+version="([^"]+)"/
+    if (!matcher.find()) {
+        throw new GradleException("No <plugin id=\"...\" version=\"...\"> found in ${dir}/plugin.xml")
+    }
+    [id: matcher.group(1), version: matcher.group(2)]
+}
+
+def moduleArchives = layout.buildDirectory.dir('modules')
+
+def moduleZipTasks = moduleSourceDirs().collect { dir ->
+    def coords = moduleCoordinates(dir)
+    def taskName = 'moduleZip' + dir.name.replaceAll('[^A-Za-z0-9]', '_')
+    tasks.register(taskName, Zip) {
+        group = 'alchemy'
+        description = "Package ${coords.id} ${coords.version} as a JPF module archive"
+        archiveFileName = "${coords.id}-${coords.version}.zip"
+        destinationDirectory = moduleArchives
+        includeEmptyDirs = false
+        from(dir) {
+            // plugin.xml plus the auxiliary directories JPF references:
+            // images/ (icons), help/ (help sets), data/ (shape resources),
+            // app/ (menu bindings) and the shape PDF collections.
+            exclude '**/.DS_Store'
+        }
+    }
+}
+
+tasks.register('moduleZips') {
+    group = 'alchemy'
+    description = 'Package every JPF module under modules/ into build/modules'
+    dependsOn moduleZipTasks
+}
+
+/* --------------------------------------------------------------------- dist */
+
+/*
+ * The application resolves its modules from "./modules" relative to the working
+ * directory (Alchemy.java: new File("modules")), so it cannot run from the
+ * project root, where modules/ holds sources. `dist` stages a runnable layout
+ * and every launch task uses it as the working directory.
+ */
+def distDir = layout.buildDirectory.dir('dist')
+
+def stageDist = tasks.register('dist', Sync) {
+    group = 'alchemy'
+    description = 'Stage a runnable distribution in build/dist (module archives + native JPen library)'
+    dependsOn jar, moduleZips
+    into distDir
+
+    from(moduleArchives) {
+        into 'modules'
+    }
+    from(jar) {
+        into 'app'
+    }
+    // JPen's loader looks for its JNI library on java.library.path; keep the
+    // packaged layout self-contained.
+    from('lib/jpen') {
+        into 'lib/jpen'
+        include '*.so', '*.dylib', '*.dll'
+    }
+}
+
+tasks.named('run', JavaExec) {
+    description = 'Launch Alchemy from the staged distribution in build/dist'
+    dependsOn stageDist
+    workingDir = distDir.get().asFile
+    systemProperty 'java.library.path', file('lib/jpen').absolutePath
+    // Matches the memory ceiling of the 008 launchers.
+    jvmArgs '-Xmx512m'
+}
+
+/* --------------------------------------------------------------- smoke test */
+
+/*
+ * A launch that exits 0 proves almost nothing: the app calls System.exit(0) on
+ * the "no modules found" path. The harness therefore has to write an explicit
+ * success marker, and that marker is what this task verifies.
+ */
+tasks.register('smokeTest', JavaExec) {
+    group = 'verification'
+    description = 'Boot Alchemy, assert every module archive registers, render the window, verify the evidence'
+    dependsOn stageDist
+
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'org.alchemy.harness.SmokeTest'
+    workingDir = distDir.get().asFile
+
+    systemProperty 'java.library.path', file('lib/jpen').absolutePath
+    jvmArgs '-Xmx512m'
+    args providers.gradleProperty('smokeTimeout').getOrElse('120')
+
+    doLast {
+        def marker = new File(workingDir, 'smoke-result.txt')
+        if (!marker.isFile()) {
+            throw new GradleException(
+                    "Smoke test produced no ${marker}. The app most likely called System.exit() during boot " +
+                    "(see ${new File(workingDir, 'log/alchemy.txt')} and the output above).")
+        }
+        def result = marker.text.readLines().find { it.startsWith('result=') }?.substring(7)
+        if (result != 'PASS') {
+            throw new GradleException("Smoke test failed: ${marker.text}")
+        }
+        logger.lifecycle "Smoke test passed: ${marker.text.readLines().findAll { !it.startsWith('result=') }*.toString().join('; ')}"
+    }
+}
+
+tasks.named('test') {
+    // No unit tests yet (MAINTENANCE.md Workstream 2). Declared so `build` is
+    // honest about what is, and is not, verified.
+    description = 'No unit tests exist yet - run :smokeTest for the end-to-end boot check'
+}
