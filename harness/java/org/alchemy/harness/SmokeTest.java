@@ -2,6 +2,7 @@ package org.alchemy.harness;
 
 import java.awt.Component;
 import java.awt.Container;
+import java.awt.Frame;
 import java.awt.GraphicsEnvironment;
 import java.awt.Window;
 import java.io.File;
@@ -16,6 +17,7 @@ import javax.swing.AbstractButton;
 import javax.swing.Icon;
 import javax.swing.JMenu;
 import javax.swing.MenuElement;
+import javax.swing.SwingUtilities;
 
 /**
  * End-to-end boot check for Alchemy without automating Swing directly.
@@ -147,6 +149,7 @@ public final class SmokeTest {
         List<String> problems = new ArrayList<String>();
         verifyUiShell(problems, details);
         verifyPluginRegistration(problems, details);
+        verifyResize(problems, details);
 
         List<String> traces = log.exceptionTraces(ALLOWED_EXCEPTIONS);
         details.add("exception_traces=" + traces.size());
@@ -232,6 +235,33 @@ public final class SmokeTest {
         details.add("tool_buttons_with_icons=" + withIcons);
         if (withIcons < 10) problems.add("tool_icons_missing:" + withIcons);
 
+    }
+
+    /**
+     * resizeWindow() has to tolerate the toolbar and canvas not existing yet, because the
+     * Windows frame peer delivers a resize while the window is being created. Check that a
+     * resize which does matter still reaches the canvas, so that guard cannot quietly turn
+     * into "never resize".
+     */
+    private static void verifyResize(List<String> problems, List<String> details) throws Exception {
+        Component window = (Component) readWindow();
+        Component canvas = (Component) readCanvas();
+        if (!(window instanceof Frame) || canvas == null) {
+            return; // verifyUiShell has already reported the missing shell
+        }
+        final Frame frame = (Frame) window;
+        final int width = frame.getWidth() + 120;
+        final int height = frame.getHeight() + 90;
+        int before = canvas.getWidth();
+        SwingUtilities.invokeLater(new Runnable() {
+            public void run() { frame.setSize(width, height); }
+        });
+        sleep(800);
+        int after = canvas.getWidth();
+        details.add("canvas_width_after_resize=" + before + "->" + after);
+        if (after <= before) {
+            problems.add("canvas_did_not_follow_window_resize:" + before + "->" + after);
+        }
     }
 
     private static int countMenuItems(Component root) {
