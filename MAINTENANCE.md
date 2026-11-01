@@ -60,10 +60,24 @@ and CI proves it on every push.
       X display and asserts: no fatal start-up error, window/canvas sized, menu bar and
       tool bar populated (48 menu items, 18 tool buttons), 28 archives -> 27 plugins
       (16 create + 11 affect), and no unexpected exception trace on stdout/stderr.
-- [ ] Add GitHub Actions matrix: ubuntu / macos / windows x JDK 17 / 21 / 25,
-      jobs = `./gradlew build smokeTest` (Xvfb on Linux). No deploy.
+- [x] GitHub Actions matrix: ubuntu / macos / windows x JDK 17 / 21 / 25
+      (`.github/workflows/ci.yml`), jobs = `build` + `smokeTest` (Xvfb on Linux,
+      runner window session on macOS/Windows), `smoke-result.txt` and the app log
+      uploaded on failure. No deploy.
 - [ ] Keep NetBeans project files working (or state explicitly in README that they are
       retired) - do not leave a half-supported second build path.
+
+**Build verification gotcha:** this checkout runs with `core.fileMode=false`, so the
+wrapper was committed mode 644 and a clone could not execute it. Building in place never
+shows that - only building a fresh clone does, so the acceptance command is:
+
+```sh
+git clone -b chore/revive-build-and-ci <fork> && cd Alchemy
+xvfb-run -a ./gradlew build smokeTest     # no system Gradle required
+```
+
+Related: `clean` cannot delete `build/` while `./gradlew run` is alive, because the app's
+cwd is `build/dist` and the mount turns open-but-deleted files into `.fuse_hidden*`.
 
 **Rule for any future UI test:** never grab the screen (`Robot.createScreenCapture`,
 `import -window root`, etc.). A grab reads whatever display the process is on, so it can

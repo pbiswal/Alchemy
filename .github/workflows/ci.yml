@@ -1,0 +1,83 @@
+# Continuous integration for the revived build (MAINTENANCE.md, Workstream 1).
+#
+# Each run proves two distinct things:
+#   build      - every source file compiles at --release 17 against the vendored
+#                lib/ jars, the app jar assembles, and all module archives get
+#                packaged in the layout AlcPlugins discovers.
+#   smokeTest  - the app actually boots and registers every module archive.
+#                A launch that merely exits 0 proves nothing, because Alchemy
+#                calls System.exit(0) on its "no modules found" path.
+#
+# Deliberately absent: any deploy/publish step. This repo has no release
+# automation to keep in sync, and publishing is not part of Workstream 1.
+name: CI
+
+on:
+  # Pushes to long-lived/integration branches plus maintenance branches. Other
+  # branches still get coverage: opening a pull request triggers the same matrix.
+  push:
+    branches: [master, 'chore/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # One shell for all three OSes so `./gradlew` is spelled the same way; the
+    # Gradle launcher script handles MSYS paths under git-bash on Windows.
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / JDK ${{ matrix.jdk }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A breakage on one platform must not hide the state of the other two.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # 17 is the committed baseline (--release 17); 21/25 are the LTS and the
+        # current JDK the source is expected to keep building on.
+        jdk: [17, 21, 25]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.jdk }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.jdk }}
+
+      # Caches the wrapper distribution and dependency lookups, and validates the
+      # committed gradle-wrapper.jar against the known-good checksum list.
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build (compile, jar, package module archives)
+        run: ./gradlew --no-daemon build
+
+      - name: Smoke test (Xvfb)
+        if: runner.os == 'Linux'
+        # -a allocates a private display; the harness refuses to run on :0/:1 so a
+        # misconfigured runner cannot test against somebody's real desktop.
+        run: xvfb-run -a --server-args="-screen 0 1280x800x24" ./gradlew --no-daemon smokeTest
+
+      - name: Smoke test (native window session)
+        if: runner.os != 'Linux'
+        run: ./gradlew --no-daemon smokeTest
+
+      - name: Upload smoke evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.os }}-jdk${{ matrix.jdk }}
+          path: |
+            build/dist/smoke-result.txt
+            build/dist/log/alchemy.txt
+          if-no-files-found: ignore
+          retention-days: 14

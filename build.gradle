@@ -210,13 +210,28 @@ def stageDist = tasks.register('dist', Sync) {
     }
 }
 
+/**
+ * JVM args shared by the tasks that launch Alchemy.
+ *
+ * JPen loads its JNI library with System.loadLibrary from an unnamed module. JDK 18+
+ * warns about that (and will block it in a future release), so opt in where the flag
+ * exists - JDK 17 does not recognise the option and would refuse to start, which is
+ * the one thing the CI matrix would then blame the application for.
+ */
+ext.applicationJvmArgs = {
+    def args = ['-Xmx512m']  // matches the memory ceiling of the 008 launchers
+    if (JavaVersion.current() >= JavaVersion.VERSION_18) {
+        args << '--enable-native-access=ALL-UNNAMED'
+    }
+    return args
+}
+
 tasks.named('run', JavaExec) {
     description = 'Launch Alchemy from the staged distribution in build/dist'
     dependsOn stageDist
     workingDir = distDir.get().asFile
     systemProperty 'java.library.path', file('lib/jpen').absolutePath
-    // Matches the memory ceiling of the 008 launchers.
-    jvmArgs '-Xmx512m'
+    jvmArgs applicationJvmArgs()
 }
 
 /* --------------------------------------------------------------- smoke test */
@@ -228,7 +243,7 @@ tasks.named('run', JavaExec) {
  */
 tasks.register('smokeTest', JavaExec) {
     group = 'verification'
-    description = 'Boot Alchemy, assert every module archive registers, render the window, verify the evidence'
+    description = 'Boot Alchemy on a private display, assert the UI shell built and every module archive registered'
     dependsOn stageDist
 
     classpath = sourceSets.smoke.runtimeClasspath
@@ -236,7 +251,7 @@ tasks.register('smokeTest', JavaExec) {
     workingDir = distDir.get().asFile
 
     systemProperty 'java.library.path', file('lib/jpen').absolutePath
-    jvmArgs '-Xmx512m'
+    jvmArgs applicationJvmArgs()
     args providers.gradleProperty('smokeTimeout').getOrElse('120')
 
     doLast {
