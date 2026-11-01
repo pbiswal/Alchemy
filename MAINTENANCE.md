@@ -6,6 +6,14 @@ feature work can resume. No feature or behaviour changes land on this branch.
 
 Branch: `chore/revive-build-and-ci` (from `master` @ `1a4ac99`)
 
+## Working agreements
+
+- Push only after the maintainer confirms. Local commits proceed without asking;
+  `git push` (including `--force-with-lease`) and `gh release` do not.
+- `origin` is the maintainer's fork (`pbiswal/Alchemy`). `upstream` (karldd) is
+  fetch-only and its `pushurl` is disabled, so an upstream push cannot happen by
+  accident.
+
 ---
 
 ## Baseline (verified 2026, OpenJDK 25.0.4.1, Fedora 44 x86_64)
@@ -133,6 +141,68 @@ exception traces); CI green on Linux/macOS/Windows.
   Linux and Windows boot clean. Until it lands, the macOS smoke step is informational so
   the diagnosis is published on every push without blocking unrelated work - flip
   `continue-on-error` back when it is fixed.
+
+---
+
+## Workstream 1b - ship something people can run
+
+Goal: `./gradlew distArchive` produces a package with the layout the application actually
+expects, and pushing a tag publishes it. The last downloadable Alchemy was built in 2018
+against a JDK that no longer exists.
+
+- [x] `dist` stages the 008 layout: `alchemy.jar` + `lib/` (22 dependency jars) +
+      `lib/jpen/` (per-OS JNI libraries) + `modules/` (28 archives) + `Alchemy` /
+      `Alchemy.bat` + `LICENSE.md` + `README.md` + a stamped `NOTICE.txt`.
+- [x] `alchemy.jar` carries a `Class-Path` manifest, so `java -jar alchemy.jar` works
+      from any directory - relative to the jar, not the cwd, which is why `run`,
+      `smokeTest` and the launchers all set their working directory to the dist layout.
+- [x] `distArchive` writes `.tar.gz`, `.zip` and `SHA256SUMS.txt`.
+- [x] `checkPackage` asserts the unpacked tree is launchable in principle: `Main-Class`
+      present, every `Class-Path` entry exists, 28 module archives, `./Alchemy` present
+      and executable.
+- [x] `verifyDist` launches the unpacked package **through its own launcher** and waits
+      for `active/total: 28 of 28`, alive and exception-free.
+- [x] `.github/workflows/release.yml`: pushing `vA.B.C` packages on all three runners and
+      publishes a GitHub Release with all six archives plus one consolidated
+      `SHA256SUMS.txt`.
+- [ ] Cut `v0.9.0` once this branch is on `master` (tag `master`, let the workflow build
+      and publish, then confirm the assets download and run).
+- [ ] Windows release gating: `checkPackage` only today, because start-up is still red on
+      Windows beyond the toolbar NPE that is fixed - add `verifyDist` for Windows in the
+      release workflow when the smoke test is green there.
+
+**The two harnesses answer different questions, and both are needed.** `smokeTest` runs
+the classes off Gradle's own classpath, so it can pass while `java -jar` cannot start;
+`verifyDist` runs the bytes out of the archive through the shipped launcher, so it is the
+only check that can see a missing module directory, a jar name the manifest does not
+match, or a launcher that forgot `java.library.path`. They share one exception allowlist
+(`SmokeTest.ALLOWED_EXCEPTIONS`) so a trace cannot be forgiven in one and failed in the
+other.
+
+**Packaging decisions, and why**
+
+| Decision | Rationale |
+| --- | --- |
+| Thin jar plus `lib/`, no fat jar | The dependencies are GPL or otherwise encumbered binary jars. Keeping them separate keeps per-jar licence provenance and matches what 008 shipped. |
+| Jar named `alchemy.jar`, unversioned | The launcher, the manifest and `java -jar` all agree on one name, so re-packing a new version never requires editing a script. |
+| `-PdistClassifier=linux\|windows\|macos` | CI builds three packages that would otherwise share a filename and cannot be staged side by side. Local builds omit it and keep the short name. |
+| Archives list what may ship (`releaseIncludes`) | `build/dist` doubles as the working directory of `run`/`smokeTest` and accumulates `log/` and result files. An allowlist means nothing leaks into a release by being forgotten. |
+| `NOTICE.txt` generated, never hand-written | It records the commit and version the package was built from. A hand-edited provenance file is wrong within one release. |
+| macOS packaged, not launched | Its runtime is known-red (see Workstream 1). Shipping a package that is structurally checked is honest as long as the release notes and `README.md` say the runtime is broken. |
+
+**Cutting a release**
+
+```sh
+./gradlew clean build distArchive                 # local package + checksums
+xvfb-run -a ./gradlew verifyDist                  # launch the unpacked package
+./gradlew distArchive -PalchemyVersion=1.0.0      # override the version
+
+git tag -s v0.9.0 -m 'Alchemy 0.9.0 (unofficial)'
+git push origin v0.9.0                            # .github/workflows/release.yml publishes
+```
+
+Do not attach artifacts from a laptop: a tag-triggered build records which commit and
+toolchain produced the bytes, and a hand-pushed artifact silently breaks that chain.
 
 ---
 
