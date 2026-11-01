@@ -82,20 +82,39 @@ public final class SmokeTest {
         }
     }
 
+    /**
+     * Whether windows are reached over X11, the only case where DISPLAY names a
+     * desktop session that may belong to a human rather than to this run. macOS
+     * (Aqua) and Windows have no DISPLAY, so their guard is the window check.
+     */
+    private static boolean usesX11() {
+        String lower = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+        return !(lower.contains("mac") || lower.contains("windows"));
+    }
+
     private static void run() throws Exception {
         if (GraphicsEnvironment.isHeadless()) {
-            fail("running headless; the Swing app cannot be verified (needs a display: use xvfb-run)", "");
+            fail("running headless; the Swing app cannot be verified (needs a window session)", "");
         }
-        /* This harness is only ever meant to run against a private display. A
-         * process pointed at the user's own session would verify nothing and
-         * would disturb their desktop. */
+        /* On X11 this harness must only run against a private display: pointed at
+         * the user's own session it would verify nothing and would disturb their
+         * desktop. DISPLAY is an X11-only concept though, so macOS and Windows are
+         * not guarded by it - they have no DISPLAY to check, and a runner without a
+         * window session is reported by the window assertions further down. */
         String display = System.getenv("DISPLAY");
-        boolean primary = display == null || ":0".equals(display) || ":+0".equals(display) || ":1".equals(display);
-        if (primary && System.getenv("ALCHEMY_SMOKE_ALLOW_PRIMARY_DISPLAY") == null) {
-            fail("refusing to run against display '" + display
-                    + "'; run under a private display (xvfb-run) or set ALCHEMY_SMOKE_ALLOW_PRIMARY_DISPLAY=1", "");
+        if (usesX11()) {
+            if (display == null) {
+                fail("no DISPLAY on " + System.getProperty("os.name")
+                        + "; run under a private display (xvfb-run), or set"
+                        + " ALCHEMY_SMOKE_ALLOW_PRIMARY_DISPLAY=1 if a session is provided another way", "");
+            }
+            boolean primary = ":0".equals(display) || ":+0".equals(display) || ":1".equals(display);
+            if (primary && System.getenv("ALCHEMY_SMOKE_ALLOW_PRIMARY_DISPLAY") == null) {
+                fail("refusing to run against display '" + display
+                        + "'; run under a private display (xvfb-run) or set ALCHEMY_SMOKE_ALLOW_PRIMARY_DISPLAY=1", "");
+            }
         }
-        details.add("display=" + display);
+        details.add("display=" + (display == null ? "(native windowing, no DISPLAY)" : display));
 
         File modules = new File("modules").getAbsoluteFile();
         if (!modules.isDirectory()) {

@@ -84,6 +84,8 @@ cwd is `build/dist` and the mount turns open-but-deleted files into `.fuse_hidde
 "pass" against an unrelated desktop, and on a desktop session with a screenshots portal it
 prompts the user for remote-desktop consent. `SmokeTest` refuses to run on display `:0`/`:1`
 for this reason; assert on component/structure state, or render the drawing model off-screen.
+The refusal is checked only where `DISPLAY` means something (X11): macOS and Windows have no
+`DISPLAY`, and CI found out the hard way that requiring one there rejects a valid runner.
 
 **Acceptance:** a clean clone builds and boots with `./gradlew build smokeTest` on a machine
 with only a JDK installed (verified: clean build -> 28 module archives -> smoke PASS, 0
