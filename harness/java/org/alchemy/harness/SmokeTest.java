@@ -4,7 +4,6 @@ import java.awt.Component;
 import java.awt.Container;
 import java.awt.GraphicsEnvironment;
 import java.awt.Window;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.PrintStream;
 import java.lang.reflect.Field;
@@ -386,33 +385,43 @@ public final class SmokeTest {
         Files.write(resultFile.toPath(), text.toString().getBytes(StandardCharsets.UTF_8));
     }
 
-    /** Captures System.out/System.err so start-up exception traces can be asserted. */
-    private static final class LogTee {
-        private final StringBuilder buffer = new StringBuilder();
+    /**
+     * Captures System.out/System.err so start-up exception traces can be asserted.
+     *
+     * stdout and stderr need separate sinks. They shared one, and because each tee
+     * rewrote that shared buffer using only its own stream's bytes, whichever stream
+     * printed last erased the other: a trace printed to stderr vanished as soon as the
+     * application logged to stdout, and the smoke test reported "exception_traces=0" for
+     * a run that had in fact thrown. Each sink now keeps its own tail.
+     *
+     * Package-private, with package-private parsing helpers, so HarnessTest can pin this
+     * behaviour without booting Alchemy or a display.
+     */
+    static final class LogTee {
+        /** Per-stream cap. The oldest bytes are dropped so late traces stay visible. */
+        private static final int CAPTURE_LIMIT = 400_000;
+
+        private final StringBuilder stdout = new StringBuilder();
+        private final StringBuilder stderr = new StringBuilder();
         private boolean installed;
 
         void install() {
             if (installed) return;
-            tee(System.out, true);
-            tee(System.err, false);
+            System.setOut(tee(System.out, stdout));
+            System.setErr(tee(System.err, stderr));
             installed = true;
         }
 
-        private void tee(final PrintStream original, final boolean stdout) {
-            final ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        private PrintStream tee(final PrintStream original, final StringBuilder sink) {
             PrintStream tee = new PrintStream(new java.io.OutputStream() {
                 @Override public void write(int b) throws java.io.IOException {
-                    synchronized (buffer) {
-                        captured.write(b);
-                        byte[] bytes = captured.toByteArray();
-                        buffer.setLength(0);
-                        buffer.append(new String(bytes, 0, Math.min(bytes.length, 400_000), StandardCharsets.UTF_8));
-                    }
+                    append(sink, new String(new byte[] {(byte) b}, StandardCharsets.UTF_8));
                     original.write(b);
                 }
 
                 @Override public void write(byte[] bytes, int off, int len) throws java.io.IOException {
-                    for (int i = 0; i < len; i++) write(bytes[off + i]);
+                    append(sink, new String(bytes, off, len, StandardCharsets.UTF_8));
+                    original.write(bytes, off, len);
                 }
 
                 @Override public void flush() throws java.io.IOException {
@@ -423,19 +432,41 @@ public final class SmokeTest {
                     original.flush();
                 }
             }, true, StandardCharsets.UTF_8);
-            if (stdout) System.setOut(tee); else System.setErr(tee);
+            return tee;
+        }
+
+        private static void append(StringBuilder sink, String text) {
+            synchronized (sink) {
+                sink.append(text);
+                int excess = sink.length() - CAPTURE_LIMIT;
+                if (excess > 0) sink.delete(0, excess);
+            }
         }
 
         List<String> exceptionTraces(String[] allowed) {
             List<String> found = new ArrayList<String>();
-            String[] lines;
-            synchronized (buffer) {
-                lines = buffer.toString().split("\n");
+            scan(stdoutText(), allowed, found);
+            scan(stderrText(), allowed, found);
+            return found;
+        }
+
+        String stdoutText() {
+            synchronized (stdout) {
+                return stdout.toString();
             }
+        }
+
+        String stderrText() {
+            synchronized (stderr) {
+                return stderr.toString();
+            }
+        }
+
+        static void scan(String text, String[] allowed, List<String> found) {
+            String[] lines = text.split("\n");
             for (int i = 0; i < lines.length; i++) {
                 String line = lines[i].trim();
-                if (!line.matches("^([a-zA-Z_$][\\w$]*\\.)+[A-Z$][\\w$]*(Exception|Error|Throwable)\\b.*")
-                        && !line.matches("^(Caused by|Suppressed):.*")) {
+                if (!isTraceHeader(line, lines, i)) {
                     continue;
                 }
                 boolean expected = false;
@@ -445,19 +476,71 @@ public final class SmokeTest {
                         break;
                     }
                 }
-                if (!expected && !found.contains(line)) found.add(line);
+                if (expected) continue;
+                // Carrying the first stack frame costs nothing and decides whether a CI
+                // annotation can be acted on: "unsupported byte count:16" is a symptom,
+                // "at ch.randelshofer.quaqua.util.BinaryPListParser.parseInt" names the
+                // component that owns the bug. Job logs need a token to read, the
+                // annotation does not.
+                String frame = firstFrame(lines, i);
+                String entry = frame == null ? line : line + " @ " + frame;
+                if (!found.contains(entry)) found.add(entry);
             }
-            return found;
         }
 
-        String tail() {
-            String text;
-            synchronized (buffer) {
-                text = buffer.toString();
+        /**
+         * Whether a captured line opens a printed stack trace.
+         *
+         * Two shapes are accepted. A type whose simple name ends in Exception/Error/
+         * Throwable is always a trace header, as it has been since this harness was
+         * written. A type that is exactly Exception, Error or Throwable counts only when
+         * a stack frame follows it: requiring a package prefix missed
+         * {@code java.lang.Exception} entirely (a probe trace with that name was logged
+         * and reported as zero traces), while accepting the bare names unconditionally
+         * would let log prose such as "Error: no pen device" fail the build.
+         */
+        static boolean isTraceHeader(String line, String[] lines, int index) {
+            if (line.matches("^(Caused by|Suppressed):.*")) return true;
+            String type = line.split("[:\\s]", 2)[0];
+            if (!type.matches("[\\w$.]+")) return false;
+            String simple = type.substring(type.lastIndexOf('.') + 1);
+            if (simple.matches("[A-Z$][\\w$]*(Exception|Error|Throwable)")) return true;
+            boolean bareThrowable = simple.equals("Exception")
+                    || simple.equals("Error") || simple.equals("Throwable");
+            return bareThrowable && firstFrame(lines, index) != null;
+        }
+
+        /**
+         * The first stack frame below {@code headerIndex}, or null when the trace ends
+         * (a trace elided by the JVM, or an exception logged without one).
+         */
+        private static String firstFrame(String[] lines, int headerIndex) {
+            int stop = Math.min(lines.length, headerIndex + 12);
+            for (int i = headerIndex + 1; i < stop; i++) {
+                String line = lines[i].trim();
+                if (line.startsWith("at ")) return line.substring(3).trim();
+                boolean continuation = line.isEmpty()
+                        || line.startsWith("...")
+                        || line.matches("^(Caused by|Suppressed):.*");
+                if (!continuation) break;
             }
+            return null;
+        }
+
+        /**
+         * The last lines of each stream, labelled.
+         *
+         * Kept separate rather than merged: which stream carried a message turned out to
+         * matter (see the class comment), and a merged tail cannot show that.
+         */
+        String tail() {
+            return tail("stdout", stdoutText()) + tail("stderr", stderrText());
+        }
+
+        private static String tail(String name, String text) {
             String[] lines = text.split("\n");
-            int from = Math.max(0, lines.length - 40);
-            StringBuilder out = new StringBuilder("last log lines:\n");
+            int from = Math.max(0, lines.length - 25);
+            StringBuilder out = new StringBuilder("last " + name + " lines:\n");
             for (int i = from; i < lines.length; i++) {
                 out.append("  ").append(lines[i]).append('\n');
             }

@@ -12,6 +12,7 @@
  *   ./gradlew smokeTest    launch headlessly (use xvfb-run on Linux), verify all
  *                          modules register, render the window, write PNG evidence
  *   ./gradlew dist         staged distribution: build/dist/{modules,lib}
+ *   ./gradlew harnessTest  test the smoke harness's own log parsing (no display)
  *
  * Workstream 1 of MAINTENANCE.md. Keep this file dependency-light: the third
  * party jars are still vendored in lib/ and moving them to Maven Central is a
@@ -270,7 +271,23 @@ tasks.register('smokeTest', JavaExec) {
 }
 
 tasks.named('test') {
-    // No unit tests yet (MAINTENANCE.md Workstream 2). Declared so `build` is
-    // honest about what is, and is not, verified.
-    description = 'No unit tests exist yet - run :smokeTest for the end-to-end boot check'
+    // No application unit tests yet (MAINTENANCE.md Workstream 2). Declared so
+    // `build` is honest about what is, and is not, verified.
+    description = 'No application unit tests yet - run :harnessTest and :smokeTest'
 }
+
+/*
+ * Harness self-test. The smoke test is what makes CI mean something, so its log
+ * parsing is tested too. It needs neither Alchemy nor a display, so it runs in check
+ * on every OS. Dependency-free by design: no test framework is downloaded, so this
+ * still works offline on a cold machine.
+ */
+def harnessTest = tasks.register('harnessTest', JavaExec) {
+    group = 'verification'
+    description = 'Tests the smoke harness log parsing.'
+    dependsOn tasks.named('compileSmokeJava')
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'org.alchemy.harness.HarnessTest'
+}
+
+tasks.named('check') { dependsOn harnessTest }
