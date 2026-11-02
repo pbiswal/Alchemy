@@ -59,7 +59,8 @@ and CI proves it on every push.
       / `smokeTest` set `workingDir` to that layout - plugin discovery uses the
       cwd-relative `new File("modules")` in `AlcPlugins`.
 - [ ] Move replaceable deps to Maven Central: Batik, MigLayout, commons-logging,
-      XMLCommons/`xml-apis`. Keep vendored: JPF 1.5.1, JPen (+ natives), Quaqua, Foxtrot.
+      XMLCommons/`xml-apis`. Keep vendored: JPF 1.5.1, JPen (+ natives), Foxtrot.
+      Quaqua leaves with the macOS work in Workstream 3, not with this list.
 - [ ] Evaluate `lib/itext.jar` (unlabelled vintage) against OpenPDF before touching
       PDF export; PDF export is a user-visible feature, do not change behaviour here.
 - [ ] Delete the developer-local leftover in `nbproject/project.properties`:
@@ -332,8 +333,19 @@ rewrite is a separate, announced branch because it changes every SHA.
 - [ ] Remove or re-source `core/AlcNative` (`System.loadLibrary("AlcNative")` for a
       binary and source that are not in this repo); its only callers are the macOS
       menu-bar toggles in `core/AlcWindow`.
-- [ ] Retire the dead macOS paths: `core/OSXAdapter` and the `com.apple.eawt` /
-      `com.apple.eio.FileManager` reflection do nothing on modern macOS.
+- [ ] Replace the macOS platform layer rather than patching it (decided: keep macOS, drop
+      Quaqua). Three steps, in this order, each verified on a Mac or a macOS runner:
+      1. delete `lib/quaqua.jar` from the build and the distribution and fall back to the
+         system Aqua look and feel - this removes the `BinaryPListParser.parseInt` crash
+         and the six-year-old jar that causes it;
+      2. replace `core/OSXAdapter`'s `com.apple.eawt` reflection with `java.awt.desktop`
+         (JDK 14+), which also clears the illegal-access `IllegalAccessException`;
+      3. re-check `AlcWindow.resizeWindow` - its null-toolbar NPE was a symptom of steps
+         1-2 leaving the window half-initialised on macOS.
+      When all three are done, remove `continue-on-error: true` from the CI smoke step and
+      restore macOS as a real gate, including `verifyDist` there.
+- [ ] Retire the remaining dead macOS paths: the `com.apple.eawt` /
+      `com.apple.eio.FileManager` reflection does nothing on modern macOS.
 - [ ] Replace fire-and-forget error handling (43 `printStackTrace`, 41 `catch (Exception)`)
       with logged, user-visible failures; remove `System.exit(0)` from plugin loading in
       favour of a real startup error path. Start with the startup/plugin/canvas paths only.
@@ -353,11 +365,22 @@ startup failures report what went wrong.
 - Migrating off Swing/Java2D or off JPF.
 - New modules or new export formats.
 
-## Open questions
+## Open questions - answered
 
-1. Is this a personal fork for one contributor, or should the revival be coordinated
-   upstream (force-push and history rewrite affect every existing fork)?
-2. Which JDK do we commit to supporting, and does macOS/Quaqua support still matter
-   (Quaqua is the oldest-looking dependency in `lib/`)?
-3. Is the JPen pen-tablet path still a requirement? It is the main reason natives ship
-   in `lib/jpen`, and it is the least likely thing to survive a platform update.
+Recorded so the next session does not re-open them.
+
+1. **Personal fork for one contributor; no upstream coordination.** Work stays on
+   `pbiswal/Alchemy`; `upstream` is a fetch remote only. Nothing needs a force-push
+   against anyone else's history, so the history rewrite of `releases/` is a
+   "announce it here, do it once" decision rather than a diplomatic one. Do not rename
+   published module coordinates anyway: third-party modules from the 2007-2011 era should
+   keep loading against this build.
+2. **Keep macOS, drop Quaqua.** The JDK floor stays 17 (CI also runs 21 and 25), and the
+   macOS work is the three-step plan in Workstream 3: system Aqua look and feel,
+   `java.awt.desktop` instead of `com.apple.eawt` reflection, then re-check the resize
+   path. Quaqua 3.x from 2011 is the direct cause of the macOS start-up failures, so
+   removing it is both the fix and the removal of the oldest dependency in `lib/`.
+3. **Pen-tablet input stays.** JPen and its native libraries are vendored and shipped, and
+   the single-archive decision means all three platforms' natives travel together. If a
+   future release wants per-platform archives, differentiate on those natives first and
+   assert the result - see Workstream 1b.
