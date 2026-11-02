@@ -144,6 +144,7 @@ jobs:
         run: |
           set -euo pipefail
           ./gradlew --no-daemon \
+            -PrequireCommitStamp \
             "-PalchemyVersion=${{ steps.version.outputs.value }}" \
             distArchive checkPackage
           {

@@ -266,16 +266,37 @@ def distDir = layout.buildDirectory.dir('dist')
 def gitOutput = { File repo, List<String> args ->
     def proc = new ProcessBuilder((['git'] + args)).directory(repo).start()
     def out = proc.inputStream.getText('UTF-8')
-    proc.errorStream.getText('UTF-8')
+    def err = proc.errorStream.getText('UTF-8')
     if (!proc.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
         proc.destroyForcibly()
         throw new IllegalStateException("git ${args.join(' ')} timed out")
     }
+    // git explains itself on stderr. Reading it and throwing it away turns a one-line diagnosis
+    // ("dubious ownership", "not a git repository") into "exited 128", so keep the first line.
     if (proc.exitValue() != 0) {
-        throw new IllegalStateException("git ${args.join(' ')} exited ${proc.exitValue()}")
+        throw new IllegalStateException("git ${args.join(' ')} exited ${proc.exitValue()}: " +
+            "${err.readLines().find { it.trim() } ?: out.readLines().find { it.trim() } ?: 'no output'}")
     }
     return out.trim()
 }
+
+// First line of an exception, for the log.
+def explain = { Exception e ->
+    "${e.class.simpleName}: ${e.message?.readLines()?.find { it.trim() } ?: 'no message'}"
+}
+
+/*
+ * `-PrequireCommitStamp` (what the release workflow passes) says: this build publishes, so an archive
+ * that cannot be dated or credited is a failure, not a fallback. Without it the build stays friendly
+ * to source tarballs, where no git really is the normal case.
+ *
+ * The flag exists because `:checkPackage` cannot assert entry dates it has no reference for: when the
+ * commit time is missing it prints that it is skipping and passes. That is right for a tarball build
+ * and wrong for a release - a runner whose git is refusing (a worktree under a world-writable /tmp is
+ * refused for "dubious ownership") would otherwise produce a green pipeline over 1970-dated archives.
+ * A check that declines to judge on missing input is not a gate; this flag is the gate.
+ */
+def requireCommitStamp = providers.gradleProperty('requireCommitStamp').isPresent()
 
 /*
  * The instant stamped on every release archive entry: the commit time of the tree being built. Read
@@ -291,7 +312,13 @@ def commitStamp = { ->
         // No git means a source tarball, and that must not fail a build. Say what was assumed
         // rather than going quiet: a swallowed exception here would silently stop every release
         // being stamped.
-        println "no git commit time available (${e.class.simpleName}: ${e.message?.readLines()?.find { it.trim() }})"
+        if (requireCommitStamp) {
+            throw new GradleException('this build was asked to publish (-PrequireCommitStamp), so it must know its '
+                + "commit time, and git did not answer (${explain(e)}). An unstamped archive is exactly what the "
+                + 'entry-date stamp exists to prevent, and :checkPackage cannot reject one, because it has no '
+                + 'expected date to compare against.')
+        }
+        println "no git commit time available (${explain(e)})"
         println 'archives keep the entry times Gradle wrote and :checkPackage will not assert them'
         return null
     }
@@ -333,9 +360,14 @@ def noticeFile = tasks.register('noticeFile') {
         try {
             def sha = gitOutput(repoDir, ['rev-parse', '--short', 'HEAD'])
             commit = gitOutput(repoDir, ['status', '--porcelain']) ? "${sha} (dirty working tree)" : sha
-        } catch (Exception ignored) {
-            // Building from a source tarball: no git, no provenance, no failure.
-            commit = 'unknown (source was not a git checkout)'
+        } catch (Exception e) {
+            // Building from a source tarball: no git, no provenance, no failure - unless this build
+            // publishes, which may not ship archives that cannot say where they came from.
+            if (requireCommitStamp) {
+                throw new GradleException("this build was asked to publish (-PrequireCommitStamp), so NOTICE.txt "
+                    + "must name a commit id, and git did not answer (${explain(e)})")
+            }
+            commit = "unknown (no git commit id: ${explain(e)})"
         }
         // Tokens, not expand(): expand() runs a template engine over the file, so a
         // stray "$" in prose would become a build failure.

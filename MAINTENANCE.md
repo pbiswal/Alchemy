@@ -282,6 +282,34 @@ locator constant to be wrong: the constant I wrote was 0x07064b50, which is the 
 actually looks for — is `PK\x06\x08`, little-endian 0x08064b50. Reading a spec summary is not the same
 as asserting both fixtures.
 
+### A build that cannot ask git ships 1970 — and the package check agrees
+
+The date assertion needs a reference. With no commit time it prints `no git commit time available`, says
+it will not assert, and lets the archive through carrying Gradle's fixed epoch (tar mtime 86400 =
+1970-01-02). Modes, gzip header and structure are all still asserted and all still pass, so a release
+pipeline whose git is refusing publishes an unstamped archive behind a green tick — the exact defect the
+stamp was added to fix.
+
+This is not hypothetical. A linked worktree under `/tmp` is refused by git (`detected dubious ownership`,
+because `/tmp` is world-writable), and the whole date mechanism disappeared without a single failure
+line. `-PrequireCommitStamp` closes it: with the flag, a build that cannot read its own commit id or
+commit time fails instead of falling back. Both workflows pass it — a CI checkout is provenance, so
+demanding it is free — and a build from a source tarball, which is the case the fallback exists for,
+does not pass it and keeps working.
+
+```bash
+git worktree add --detach /tmp/stamp-test HEAD
+(cd /tmp/stamp-test && ./gradlew distArchive -PalchemyVersion=0.9.0 -PrequireCommitStamp)  # must FAIL
+(cd /tmp/stamp-test && ./gradlew distArchive -PalchemyVersion=0.9.0)                       # must WARN, pass
+git worktree remove --force /tmp/stamp-test
+```
+
+The same investigation fixed the error text: `gitOutput` read git's stderr and threw it away, so every
+git failure was reported as `exited 128`. The first stderr line now travels with the exception, which is
+what turned "exited 128" into "dubious ownership in repository at '/tmp/wt-verify'" — a diagnosis you
+can act on. The rule generalises: **a check that skips on missing input is not a gate**, and a release
+pipeline has to state that the input is mandatory.
+
 **Modes: asserted from the archive bytes, not from the filesystem.** `checkPackage` also runs
 `entryModeProblems(tar, zip, "${distName}/Alchemy")` and `gzipProblems(tar)` from
 `gradle/archive-checks.gradle`, which read the mode fields exactly the way the date code reads the

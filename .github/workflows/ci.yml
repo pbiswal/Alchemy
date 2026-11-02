@@ -63,7 +63,10 @@ jobs:
         # distArchive/checkPackage are in the default run on purpose: the release
         # workflow only exercises them when a tag is pushed, so a packaging regression
         # would otherwise sit there until somebody cut a release over it.
-        run: ./gradlew --no-daemon build distArchive checkPackage
+        # -PrequireCommitStamp: this checkout is the provenance, so insist on it. Without the
+        # flag a build whose git refuses (see build.gradle) falls back to unstamped archives
+        # that checkPackage declines to judge.
+        run: ./gradlew --no-daemon -PrequireCommitStamp build distArchive checkPackage
 
       - name: Smoke test${{ matrix.os == 'macos-latest' && ' (informational)' || '' }}
         id: smoke
