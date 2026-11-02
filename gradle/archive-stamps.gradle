@@ -1,0 +1,234 @@
+/*
+ * Archive entry times: the commit, never the clock.
+ *
+ * Reproducible archives need fixed entry timestamps, so build.gradle sets
+ * "preserveFileTimestamps = false". Gradle then writes the epoch, and every file a user
+ * unpacked was dated 1970 (tar) or 1980 (zip, whose date format cannot represent anything
+ * earlier). That is what a reproducible archive looks like when nobody explains it, and
+ * users reasonably read it as a corrupt or years-stale download.
+ *
+ * Truthful dates and reproducibility are not in conflict. Every entry is stamped with the
+ * commit time of the tree being released: one instant, derived from the repository,
+ * identical on every machine. Archives built from the same commit on Linux, Windows and
+ * macOS still compare byte for byte equal, which is what the release workflow's
+ * cross-operating-system checksum comparison depends on.
+ *
+ * Two decisions inside this file are load-bearing:
+ *
+ *  - Entries are stamped by patching the finished archive, not by re-packing it. A re-pack
+ *    would touch compression, entry order, the extra fields and the unix modes that carry
+ *    the launcher's executable bit - all of which are already correct and checked
+ *    elsewhere. Patching touches four bytes per entry per copy and nothing else.
+ *  - The zip date is encoded here, in UTC, instead of going through the JVM's default
+ *    timezone (the zip format stores local time with no zone). A build in a +05:30
+ *    timezone and a build on a UTC runner therefore produce the same bytes, which is not
+ *    true of java.util.zip's own date handling.
+ *
+ * tar stores epoch seconds, so a tar entry matches the commit instant exactly and
+ * timezone-free. zip stores a DOS date with no zone, so readers in other timezones see the
+ * stamp shifted by their offset - the same shift any zip written on another machine would
+ * show. Assertions about zip therefore compare the year, not the instant.
+ *
+ * If the commit time is unavailable (a source tree with no .git), stamping is skipped,
+ * archives keep the epoch, and no date is asserted. Silence would be worse than a warning,
+ * so build.gradle prints one.
+ */
+
+// Read (stamp == null) or rewrite (non-null) the mtime of every entry in a .tar.gz.
+// Returns one mtime per entry in archive order, so callers can both assert the value and
+// count how many entries were touched.
+//
+// The archive is decompressed, patched and recompressed rather than re-packed: re-packing
+// would also choose compression levels, entry order and extra fields, and the point of this
+// tool is to change four bytes per entry and nothing else. GZIPOutputStream always writes
+// MTIME 0, so the container stays deterministic too.
+List<Long> tarTimes(File archive, Long stamp) {
+    def out = new ByteArrayOutputStream(16 * 1024 * 1024)
+    new java.util.zip.GZIPInputStream(new FileInputStream(archive)).withCloseable { gz ->
+        byte[] chunk = new byte[64 * 1024]
+        int read
+        while ((read = gz.read(chunk)) > 0) {
+            out.write(chunk, 0, read)
+        }
+    }
+    byte[] bytes = out.toByteArray()
+
+    def seen = new ArrayList<Long>()
+    boolean changed = false
+    long at = 0
+
+    while (at + 512 <= bytes.length) {
+        int end = (int) (at + 512)
+        boolean blank = true
+        for (int i = (int) at; i < end; i++) {
+            if (bytes[i] != 0) { blank = false; break }
+        }
+        if (blank) break                                       // a zero block ends the archive
+
+        byte[] hdr = new byte[512]
+        System.arraycopy(bytes, (int) at, hdr, 0, 512)
+        if (new String(hdr, 257, 5, 'US-ASCII') != 'ustar') {
+            throw new GradleException("${archive.name}: no ustar magic at byte ${at}, refusing to guess header boundaries")
+        }
+        /*
+         * ustar keeps mtime in the header, which is what this patches. PAX keeps a second
+         * mtime in an extension line and extractors honour that one instead, so if Gradle
+         * ever starts emitting PAX headers, fail here rather than pass an assertion about a
+         * field nothing reads.
+         */
+        String typeflag = new String(hdr, 156, 1, 'US-ASCII')
+        if (typeflag == 'x' || typeflag == 'g') {
+            throw new GradleException("${archive.name}: PAX ${typeflag == 'x' ? 'extended' : 'global'} header at byte ${at}: " +
+                                      'its mtime extension line overrides the header field this tool patches')
+        }
+        seen << Long.parseLong(new String(hdr, 136, 11, 'US-ASCII').trim(), 8)
+
+        if (stamp != null && seen.last() != stamp) {
+            // mtime: 11 octal digits, space terminated (accepted by GNU tar and ustar).
+            System.arraycopy(String.format('%011o ', stamp).getBytes('US-ASCII'), 0, hdr, 136, 12)
+            for (int i = 148; i < 156; i++) hdr[i] = (byte) 0x20
+            long sum = 0
+            for (int i = 0; i < 512; i++) sum += (hdr[i] & 0xff)
+            // Header checksum: 6 octal digits, NUL, space - the GNU convention.
+            System.arraycopy(String.format('%06o\0 ', sum).getBytes('US-ASCII'), 0, hdr, 148, 8)
+            System.arraycopy(hdr, 0, bytes, (int) at, 512)
+            changed = true
+        }
+
+        String sizeField = new String(hdr, 124, 12, 'US-ASCII').trim()
+        long size = sizeField.isEmpty() ? 0L : Long.parseLong(sizeField, 8)
+        at += 512 + (((size + 511) >> 9) << 9)                  // header, then its padded data
+    }
+
+    if (changed) {
+        new java.util.zip.GZIPOutputStream(new FileOutputStream(archive)).withCloseable { it.write(bytes) }
+        return tarTimes(archive, null)                          // report what is on disk now
+    }
+    return seen
+}
+
+// Reads (stamp == null) or rewrites (non-null) the DOS date of every entry in a zip.
+// Returns the set of raw DOS date words present afterwards.
+//
+// Walking starts at the end-of-central-directory record: it is the only place that says how
+// many entries exist and where they are, and each central entry carries the offset of its
+// local header, so both copies of a date get patched. Parsing forward from offset 0 would
+// have to cope with streamed entries whose sizes live in a data descriptor after the data.
+List<Integer> zipTimes(File archive, Long stamp) {
+    def raf = new RandomAccessFile(archive, stamp == null ? 'r' : 'rw')
+    def seen = new ArrayList<Integer>()
+    try {
+        long eocd = findZipEnd(raf)
+        if (eocd < 0) throw new GradleException("${archive.name}: no end-of-central-directory record")
+        if (readLe32(raf, eocd + 16) == 0xffffffffL) {
+            throw new GradleException("${archive.name}: zip64 end-of-central-directory is beyond the stamper")
+        }
+        int count = (int) readLe16(raf, eocd + 10)
+        long at = readLe32(raf, eocd + 16)
+
+        int stampTime = 0
+        int stampDate = 0
+        if (stamp != null) {
+            stampTime = (int) dosDateTime(stamp)[0]
+            stampDate = (int) dosDateTime(stamp)[1]
+        }
+
+        for (int n = 0; n < count; n++) {
+            if (readLe32(raf, at) != 0x02014b50L) {
+                throw new GradleException("${archive.name}: central directory entry ${n} is not where it should be")
+            }
+            int nameLen = (int) readLe16(raf, at + 28)
+            int extraLen = (int) readLe16(raf, at + 30)
+            int commentLen = (int) readLe16(raf, at + 32)
+            long local = readLe32(raf, at + 42)
+
+            int date = (int) readLe16(raf, at + 14)
+            seen << date
+
+            if (stamp != null && date != stampDate) {
+                writeLe16(raf, at + 12, stampTime)
+                writeLe16(raf, at + 14, stampDate)
+                if (readLe32(raf, local) != 0x04034b50L) {
+                    throw new GradleException("${archive.name}: local header for entry ${n} is corrupt")
+                }
+                writeLe16(raf, local + 10, stampTime)
+                writeLe16(raf, local + 12, stampDate)
+            }
+            at += 46 + nameLen + extraLen + commentLen
+        }
+    } finally {
+        raf.close()
+    }
+    return seen
+}
+
+// DOS date/time words, encoded in UTC. time = h:m:s/2, date = year-1980:month:day.
+List<Integer> dosDateTime(long epochSeconds) {
+    def t = java.time.Instant.ofEpochSecond(epochSeconds).atZone(java.time.ZoneOffset.UTC).toLocalDateTime()
+    int time = (t.hour << 11) | (t.minute << 5) | (t.second.intdiv(2) as int)
+    int date = ((t.year - 1980) << 9) | (t.monthValue << 5) | t.dayOfMonth
+    return [time, date]
+}
+
+int dosYear(int dosDate) { ((dosDate >> 9) & 0x7f) + 1980 }
+
+private long findZipEnd(RandomAccessFile raf) {
+    // The record is the last 22 bytes unless a comment follows it; comments run to 65 535.
+    int window = (int) Math.min(raf.length(), 65_557L)
+    byte[] tail = new byte[window]
+    raf.seek(raf.length() - window)
+    raf.readFully(tail)
+    for (int i = tail.length - 22; i >= 0; i--) {
+        if (tail[i] == 0x50 && tail[i + 1] == 0x4b && tail[i + 2] == 0x05 && tail[i + 3] == 0x06) {
+            return raf.length() - window + i
+        }
+    }
+    return -1L
+}
+
+private long readLe16(RandomAccessFile f, long at) {
+    byte[] b = new byte[2]
+    f.seek(at); f.readFully(b)
+    return (long) ((b[0] & 0xff) | ((b[1] & 0xff) << 8))
+}
+
+private long readLe32(RandomAccessFile f, long at) {
+    byte[] b = new byte[4]
+    f.seek(at); f.readFully(b)
+    return (b[0] & 0xffL) | ((b[1] & 0xffL) << 8) | ((b[2] & 0xffL) << 16) | ((b[3] & 0xffL) << 24)
+}
+
+private void writeLe16(RandomAccessFile f, long at, int value) {
+    f.seek(at)
+    f.write(value & 0xff)
+    f.write((value >> 8) & 0xff)
+}
+
+// Stamp every entry of one archive (tar.gz or zip, chosen by name); returns the number of
+// entries written, which is how the build says which tasks were touched without reading
+// them again.
+ext.stampArchive = { File archive, Long stamp ->
+    def times = archive.name.endsWith('.zip') ? zipTimes(archive, stamp) : tarTimes(archive, stamp)
+    return times.size()
+}
+
+/*
+ * The date half of the package contract, as a list of problems (empty means pass).
+ *
+ * tar stores epoch seconds, so an entry can be matched exactly and timezone-free. zip
+ * stores a DOS date with no zone, so the year is compared instead; the year is stable for
+ * any timezone offset a build realistically runs in, while the instant is not.
+ */
+ext.entryDateProblems = { File tarArchive, File zipArchive, Long stamp ->
+    def problems = []
+    def tarStamps = tarTimes(tarArchive, null).toUnique()
+    if (tarStamps != [stamp]) {
+        problems << "${tarArchive.name}: tar entry times are not the commit time - expected [${stamp}], found ${tarStamps}"
+    }
+    int commitYear = java.time.Instant.ofEpochSecond(stamp).atZone(java.time.ZoneOffset.UTC).year
+    def zipYears = zipTimes(zipArchive, null).collect { dosYear(it) }.toUnique()
+    if (zipYears != [commitYear]) {
+        problems << "${zipArchive.name}: zip entry years are not the commit year - expected [${commitYear}], found ${zipYears}"
+    }
+    return problems
+}

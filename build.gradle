@@ -27,6 +27,26 @@ plugins {
     id 'java'
 }
 
+apply from: 'gradle/archive-stamps.gradle'
+
+/*
+ * Bound to locals so task actions can call them: plain `stampArchive(...)` written inside a task
+ * action resolves against the task rather than the project's extra properties and fails at
+ * execution time with "Could not find method stampArchive()".
+ */
+def stampArchive = ext.stampArchive
+def entryDateProblems = ext.entryDateProblems
+
+/*
+ * Snapshots of script objects that task actions may not touch: resolving rootDir, calling file(), or
+ * reading project from inside a task action is a configuration-cache violation, so the values are
+ * taken while configuring and the actions only ever see plain Strings and Files. Declared above every
+ * closure that uses them: a def local is not in the script binding, so a closure defined before its
+ * declaration throws MissingProperty at execution time.
+ */
+def repoDir = rootDir
+def versionString = project.version.toString()
+
 group = 'org.alchemy'
 version = providers.gradleProperty('alchemyVersion').getOrElse('0.9.0')
 
@@ -168,7 +188,7 @@ tasks.named('jar', Jar) {
  * directory happened.
  */
 def moduleSourceDirs = {
-    def root = file('modules')
+    def root = new File(repoDir, 'modules')
     root.listFiles().findAll { it.isDirectory() && new File(it, 'plugin.xml').isFile() }.sort { it.name }
 }
 
@@ -243,13 +263,33 @@ def gitOutput = { File repo, List<String> args ->
     return out.trim()
 }
 
+/*
+ * The instant stamped on every release archive entry: the commit time of the tree being built. Read
+ * *inside* the tasks that need it, never while configuring: the configuration cache treats a git call
+ * there as an error, and a stamp taken while configuring would describe whatever HEAD was when the
+ * build was first configured. Null when building from a tarball with no git metadata, in which case
+ * the package check stops asserting dates rather than asserting a fiction.
+ */
+def commitStamp = { ->
+    try {
+        return Long.parseLong(gitOutput(repoDir, ['log', '-1', '--format=%ct']).trim())
+    } catch (Exception e) {
+        // No git means a source tarball, and that must not fail a build. Say what was assumed
+        // rather than going quiet: a swallowed exception here would silently stop every release
+        // being stamped.
+        println "no git commit time available (${e.class.simpleName}: ${e.message?.readLines()?.find { it.trim() }})"
+        println 'archives keep the entry times Gradle wrote and :checkPackage will not assert them'
+        return null
+    }
+}
+
 def noticeFile = tasks.register('noticeFile') {
     group = 'alchemy'
     description = 'Generate NOTICE.txt (provenance and known limitations of this build)'
-    def template = file('packaging/NOTICE.template')
+    def template = new File(repoDir, 'packaging/NOTICE.template')
     def target = layout.buildDirectory.file('notice/NOTICE.txt')
     inputs.file template
-    inputs.property 'version', project.version.toString()
+    inputs.property 'version', versionString
     outputs.file target
     // Provenance is read from git on every run. It cannot be a declared input without
     // reading it while configuring, and Gradle 9 reports exec at configuration time as a
@@ -259,8 +299,8 @@ def noticeFile = tasks.register('noticeFile') {
     doLast {
         String commit
         try {
-            def sha = gitOutput(rootDir, ['rev-parse', '--short', 'HEAD'])
-            commit = gitOutput(rootDir, ['status', '--porcelain']) ? "${sha} (dirty working tree)" : sha
+            def sha = gitOutput(repoDir, ['rev-parse', '--short', 'HEAD'])
+            commit = gitOutput(repoDir, ['status', '--porcelain']) ? "${sha} (dirty working tree)" : sha
         } catch (Exception ignored) {
             // Building from a source tarball: no git, no provenance, no failure.
             commit = 'unknown (source was not a git checkout)'
@@ -268,9 +308,9 @@ def noticeFile = tasks.register('noticeFile') {
         // Tokens, not expand(): expand() runs a template engine over the file, so a
         // stray "$" in prose would become a build failure.
         target.get().asFile.text = template.getText('UTF-8')
-                .replace('@VERSION@', project.version.toString())
+                .replace('@VERSION@', versionString)
                 .replace('@COMMIT@', commit)
-        logger.lifecycle "NOTICE.txt stamped with commit ${commit}"
+        println "NOTICE.txt stamped with commit ${commit}"
     }
 }
 
@@ -382,6 +422,12 @@ def distTar = tasks.register('distTar', Tar) {
     archiveFileName = "${distBaseName}.tar.gz"
     destinationDirectory = layout.buildDirectory.dir('distributions')
     compression = Compression.GZIP
+    doLast {
+        def stamp = commitStamp()
+        if (stamp != null) {
+            println "tar entry times set to commit ${stamp} for ${stampArchive(archiveFile.get().asFile, stamp)} entries"
+        }
+    }
 }
 
 def distZip = tasks.register('distZip', Zip) {
@@ -395,6 +441,12 @@ def distZip = tasks.register('distZip', Zip) {
     }
     archiveFileName = "${distBaseName}.zip"
     destinationDirectory = layout.buildDirectory.dir('distributions')
+    doLast {
+        def stamp = commitStamp()
+        if (stamp != null) {
+            println "zip entry times set to commit ${stamp} for ${stampArchive(archiveFile.get().asFile, stamp)} entries"
+        }
+    }
 }
 
 def distChecksums = tasks.register('distChecksums') {
@@ -411,7 +463,7 @@ def distChecksums = tasks.register('distChecksums') {
             "${digest.digest(bytes).collect { String.format('%02x', it) }.join('')}  ${it.name}"
         }
         sums.get().asFile.text = lines.join('\n') + '\n'
-        logger.lifecycle "Checksums: ${lines.join(' ')}"
+        println "Checksums: ${lines.join(' ')}"
     }
 }
 
@@ -442,7 +494,13 @@ def unpackDist = tasks.register('unpackDist', Sync) {
 def checkPackage = tasks.register('checkPackage') {
     group = 'verification'
     description = 'Assert the packed distribution is complete and self-describing'
-    dependsOn unpackDist
+    // distZip as well as the unpacked tree: the entry dates exist only in the archives, and
+    // unpacking is where a bad build can hide a problem.
+    dependsOn unpackDist, distZip
+    // Providers, captured while configuring: reaching for the distTar/distZip *task objects* from
+    // the action is a configuration-cache violation, and the archive paths are all this needs.
+    def tarFile = distTar.flatMap { it.archiveFile }
+    def zipFile = distZip.flatMap { it.archiveFile }
     doLast {
         def root = packagedDir
         def appJar = new File(root, 'alchemy.jar')
@@ -497,7 +555,22 @@ def checkPackage = tasks.register('checkPackage') {
             if (!new File(root, 'README.md').isFile() || !new File(root, 'LICENSE.md').isFile()) {
                 throw new GradleException('README.md or LICENSE.md missing from the archive.')
             }
-            logger.lifecycle "Package check: Main-Class=${mainClass}, " +
+            // Entry dates, asserted on the archives themselves: unpacking cannot see them. A
+            // stamping tool that nothing checks is a stamping tool that silently stops working,
+            // and "silently" is the failure this whole detour exists to avoid.
+            def stamp = commitStamp()
+            if (stamp != null) {
+                def tarArch = tarFile.get().asFile
+                def zipArch = zipFile.get().asFile
+                def dateProblems = entryDateProblems(tarArch, zipArch, stamp)
+                if (dateProblems) {
+                    throw new GradleException('Release archive entry dates are wrong:\n  ' +
+                            dateProblems.join('\n  '))
+                }
+                println "Package check: every entry of ${tarArch.name} and ${zipArch.name} " +
+                        "dated with commit ${stamp}"
+            }
+            println "Package check: Main-Class=${mainClass}, " +
                     "classpath_entries=${entries.size()}, module_archives=${archives.size()}, launcher=${launcher.name}"
         } finally {
             jar.close()
@@ -550,7 +623,7 @@ tasks.register('smokeTest', JavaExec) {
         if (result != 'PASS') {
             throw new GradleException("Smoke test failed: ${marker.text}")
         }
-        logger.lifecycle "Smoke test passed: ${marker.text.readLines().findAll { !it.startsWith('result=') }*.toString().join('; ')}"
+        println "Smoke test passed: ${marker.text.readLines().findAll { !it.startsWith('result=') }*.toString().join('; ')}"
     }
 }
 
