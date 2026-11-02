@@ -69,14 +69,15 @@ and CI proves it on every push.
       tool bar populated (48 menu items, 18 tool buttons), 28 archives -> 27 plugins
       (16 create + 11 affect), and no unexpected exception trace on stdout/stderr.
 - [x] GitHub Actions matrix: ubuntu / macos / windows x JDK 17 / 21 / 25
-      (`.github/workflows/ci.yml`), jobs = `build` + `smokeTest` (Xvfb on Linux,
-      runner window session on macOS/Windows), `smoke-result.txt` and the app log
-      uploaded on failure. No deploy. The smoke step also prints the harness verdict
-      into the job summary and raises a `::error::` annotation carrying the failing
-      exception and its source location, because Actions job logs need a token to
-      read and fork CI runs get debugged from outside. macOS smoke is
-      `continue-on-error` - see the macOS note below; macOS compile/package stays a
-      real gate.
+      (`.github/workflows/ci.yml`), one `build` job running
+      `build distArchive checkPackage` everywhere and `verifyDist` on Linux under Xvfb,
+      so a packaging or launcher regression is caught on the commit that caused it and
+      the archive is proven to start on the platform that gets published. macOS smoke is
+      `continue-on-error` - see the macOS note below; macOS compile/package stays a real
+      gate. Results are mirrored into the job summary with a `::error::` annotation, and
+      `smoke-result.txt`, `smoke-stdout.log` and the app log are uploaded on failure,
+      because Actions job logs need a token to read and fork CI runs get debugged from
+      outside. No deploy step - publishing lives in `release.yml`.
 - [ ] Keep NetBeans project files working (or state explicitly in README that they are
       retired) - do not leave a half-supported second build path.
 
@@ -162,14 +163,18 @@ against a JDK that no longer exists.
       and executable.
 - [x] `verifyDist` launches the unpacked package **through its own launcher** and waits
       for `active/total: 28 of 28`, alive and exception-free.
-- [x] `.github/workflows/release.yml`: pushing `vA.B.C` packages on all three runners and
-      publishes a GitHub Release with all six archives plus one consolidated
-      `SHA256SUMS.txt`.
-- [ ] Cut `v0.9.0` once this branch is on `master` (tag `master`, let the workflow build
-      and publish, then confirm the assets download and run).
-- [ ] Windows release gating: `checkPackage` only today, because start-up is still red on
-      Windows beyond the toolbar NPE that is fixed - add `verifyDist` for Windows in the
-      release workflow when the smoke test is green there.
+- [x] `.github/workflows/release.yml`: pushing `vA.B.C` builds one portable package,
+      launch-tests it, checks the same recipe on Windows and macOS, and publishes a
+      GitHub Release with both archive formats plus `SHA256SUMS.txt`.
+- [x] `v0.9.0` cut and published: https://github.com/pbiswal/Alchemy/releases/tag/v0.9.0
+- [x] The every-push CI gate runs the packaging too (`distArchive`, `checkPackage`, and
+      `verifyDist` on Linux), so a packaging regression is red on the commit that caused
+      it instead of at release time. Proven by sabotage: a `NOTICE.txt` with an
+      unsubstituted `@COMMIT@` fails the gate as intended.
+- [ ] Windows release gating: the release workflow launch-tests the package on Windows
+      informationally (`verify-recipe`), because nobody has yet seen `Alchemy.bat` start
+      inside a Windows runner. When that step reports `result=PASS` on a real tag, make
+      `verifyDist` a normal gating step there instead of the tolerated one.
 
 **The two harnesses answer different questions, and both are needed.** `smokeTest` runs
 the classes off Gradle's own classpath, so it can pass while `java -jar` cannot start;
@@ -185,10 +190,17 @@ other.
 | --- | --- |
 | Thin jar plus `lib/`, no fat jar | The dependencies are GPL or otherwise encumbered binary jars. Keeping them separate keeps per-jar licence provenance and matches what 008 shipped. |
 | Jar named `alchemy.jar`, unversioned | The launcher, the manifest and `java -jar` all agree on one name, so re-packing a new version never requires editing a script. |
-| `-PdistClassifier=linux\|windows\|macos` | CI builds three packages that would otherwise share a filename and cannot be staged side by side. Local builds omit it and keep the short name. |
+| One package, not three | `lib/jpen` carries a native library for every OS, so a per-platform archive is the same bytes under a different filename - `SHA256SUMS.txt` proved it for all three published names. One archive name cannot lie about being platform-specific; the three runners instead verify the packaging recipe and print their own checksums so a non-reproducible build is visible. |
 | Archives list what may ship (`releaseIncludes`) | `build/dist` doubles as the working directory of `run`/`smokeTest` and accumulates `log/` and result files. An allowlist means nothing leaks into a release by being forgotten. |
 | `NOTICE.txt` generated, never hand-written | It records the commit and version the package was built from. A hand-edited provenance file is wrong within one release. |
 | macOS packaged, not launched | Its runtime is known-red (see Workstream 1). Shipping a package that is structurally checked is honest as long as the release notes and `README.md` say the runtime is broken. |
+
+**If per-platform packages are ever wanted, differentiate first.** Splitting
+`lib/jpen` by OS (keep `.so` for Linux, `.dll` for Windows, `.jnilib`/`.dylib` for
+macOS) is the only change that makes the filenames mean something; it costs a wrong
+filter silently losing tablet support on that platform, which today's single archive
+cannot do. Re-add a classifier to `build.gradle` only together with such a filter and a
+`checkPackage` assertion that the archive holds the natives for exactly one OS.
 
 **Cutting a release**
 
@@ -203,6 +215,72 @@ git push origin v0.9.0                            # .github/workflows/release.ym
 
 Do not attach artifacts from a laptop: a tag-triggered build records which commit and
 toolchain produced the bytes, and a hand-pushed artifact silently breaks that chain.
+
+**Release workflow (`.github/workflows/release.yml`)**
+
+Runs on tags matching `vA.B.C` and nowhere else, so an ordinary push can never publish.
+
+- One `package` job (Linux): build, run every check including the launch test, upload the
+  two archives and their checksums as one artifact.
+- A `verify-recipe` job (Windows, macOS): builds and structurally checks the same recipe
+  and prints its own checksums to the job summary. Because Gradle writes archive entries
+  with fixed timestamps, those checksums are expected to match the published ones
+  exactly - the first release produced identical bytes on all three runners, which is
+  evidence the packaging is portable and reproducible. Windows additionally tries
+  launching the package there, informationally.
+- A `release` job publishes with auto-generated notes and nothing else. If the package
+  job fails, no release is created, so a failed release can never point at half a build.
+
+Two release-specific rules:
+
+- **The notes are generated, never hand-written.** They must keep telling the truth about
+  the platform that starts and the platform that is merely packaged - that is the
+  difference between an honest unofficial build and a misleading one. The first published
+  notes claimed one archive per platform when the archives were byte-identical; that is
+  why the workflow now publishes a single package.
+- **The artifact round-trip is verified** (`sha256sum -c`) after download, because the
+  published bytes are the ones that survive upload, not the ones the build printed.
+
+Do not upload hand-built artifacts from a laptop: a tag-triggered build records which
+commit and toolchain produced the bytes, and a hand-pushed artifact silently breaks
+that chain.
+
+---
+
+## Harness tests (`harness/java/`)
+
+Three programs, deliberately different:
+
+| Program | Gradle task | Needs a display | What it proves |
+| --- | --- | --- | --- |
+| `HarnessTest` | `harnessTest` (inside `check`) | no | the log parser the other two depend on |
+| `SmokeTest` | `smokeTest` | yes (Xvfb in CI) | the app boots and activates all 28 modules |
+| `ArtifactSmokeTest` | `verifyDist` | yes | the published package boots through its own launcher |
+
+**`HarnessTest` is the one that keeps the other two honest.** `SmokeTest`'s only real
+gate is "zero unexpected exception traces in the captured log", so a parser bug makes the
+whole suite vacuously green. It runs as a plain `JavaExec` - no test framework, no
+dependency download, no AWT - so `./gradlew check` works offline and headless. Run it
+alone with `./gradlew harnessTest`; its nine checks are named after the behaviour they
+pin.
+
+**Both harness bugs below were found by sabotage** (introducing the fault, watching the
+gate stay green), not by reading the code. When a change depends on a check, break it on
+purpose once and confirm the check says why.
+
+1. `LogTee` kept stdout and stderr in one buffer, so a trace on stderr was erased by the
+   next line on stdout. `SmokeTest` passed while a failure it was supposed to catch sat
+   unnoticed - the silent-green case.
+2. The release workflow's provenance stamp used Gradle `exec` at configuration time. It
+   threw, the `try/catch` swallowed it, and every package shipped `commit unknown`.
+   `checkPackage` now fails if the `@...@` tokens survive, which is the assertion that
+   would have caught it originally.
+
+**Pixel checks** (`Robot.createScreenCapture`, `import -window root`) stay forbidden, and
+`-Djava.awt.headless=true` is not a sufficient guard because it does not stop `Robot`.
+When one is eventually added it must render to a `BufferedImage` or a `TAG_XYSURFACE`
+capture session, and must be able to say which window it captured. See **Working
+agreements**.
 
 ---
 
