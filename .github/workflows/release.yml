@@ -358,8 +358,9 @@ jobs:
             echo 'their own SHA-256 to the log. Entry dates come from the commit rather than from'
             echo 'the moment of building, so identical hashes across runners is a real result'
             echo 'rather than an artefact of timestamps; a difference names the platform where it'
-            echo 'stopped being true. `gradle/archive-stamps.gradle` does the stamping and'
-            echo '`checkPackage` asserts the dates, on every package build, on both formats.'
+            echo 'stopped being true. Gradle writes the date (`reproducibleFileTimestamp`) and'
+            echo '`checkPackage` reads the archive headers back and asserts it, on every package'
+            echo 'build, on both formats.'
             echo
             echo '## Known defects'
             echo

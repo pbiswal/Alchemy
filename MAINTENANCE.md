@@ -196,38 +196,57 @@ one of the 69 entries in an unpacked Alchemy folder built in November 2026 was d
 `jar -vft` report 1970 for files that did not exist in 1970, and anyone comparing an old
 download with a new one by mtime would conclude the new one is fifty-six years older.
 
-Gradle 9.8.2 cannot fix this from a copy spec: `FileCopyDetails` exposes `getLastModified()`
-and no setter, `Sync` and `Zip` have no date property, and `preserveFileTimestamps = false`
-only chooses between "use the file" and "use the epoch". So `gradle/archive-stamps.gradle`
-rewrites the entries after the archive is assembled:
+Gradle 9.7.0 added the property this needed: `AbstractArchiveTask.reproducibleFileTimestamp`, a
+`Property<Long>` of epoch milliseconds that archive tasks consult when `preserveFileTimestamps` is
+false (Elastic filed gradle/gradle#36175 asking for it for exactly this use — stamping with a git
+commit time). `build.gradle` therefore says, once per release archive:
+
+```groovy
+reproducibleFileTimestamp = commitEntryTime   // providers.provider { commit time of HEAD, in ms }
+```
 
 - The date is the **commit** instant (`git log -1 --format=%ct`) — the only fact about a
   release that is both fixed and true. The source date rather than the build date is what
   makes two rebuilds comparable.
-- It patches bytes in the finished archive instead of re-packing it, so compression, entry
-  order, extra fields and modes are untouched; only the mtime and, for tar, the header
-  checksum change. A re-pack would be a second place for the recipe to be wrong.
-- Zip stores the date twice, in the central directory and in each local header, and DOS
-  dates carry no time zone, so the encoding is done in UTC explicitly rather than by JVM
-  default. `gradle.properties` also pins the build JVM to UTC as insurance against the next
-  plugin that writes a local-time value.
+- `build.gradle` refuses to run under Gradle older than 9.7.0 rather than letting it die with
+  "unknown property"; the wrapper pins the version, so the only way to hit the message is to
+  run a hand-installed Gradle.
+- **There used to be a byte-level patcher here, and deleting it was the point.** Until now this
+  file's script plugin rewrote the mtime of every entry in the finished archive, and the readers
+  in the same file then checked that the entries said what the writer had written. A writer and a
+  reader that misunderstand a header agree with each other, and the check that exists to catch
+  the other passes — the worst property an assertion can have. Before removing anything, the two
+  mechanisms were measured against each other from the same commit with the same tree state:
+  identical SHA-256 for both formats (`02cf8a49174de6b9…` tar, `22cc806701242feb…` zip) — so v0.9.0
+  did not need republishing, and the patcher went. The readers stayed, and now they audit
+  somebody else's implementation, which is the only way one of them can fail usefully.
+- Zip stores the date twice, in the central directory and in each local header, and DOS dates
+  carry no time zone. Gradle encodes that value **in UTC itself**, so no build-time pin is needed:
+  with the `systemProp.user.timezone` pin deleted, the native build was byte-identical under
+  `TZ=UTC`, `TZ=America/Los_Angeles`, `TZ=Asia/Kolkata` and `TZ=America/Sao_Paulo`, and identical to
+  the byte-patcher's `TZ=UTC` output as well. The pin is gone from `gradle.properties`, because a
+  setting whose stated reason turns out to be false is a trap for the next reader.
 - Tar needs no format setting: Gradle writes plain ustar headers here, and that is *verified* rather
-  than assumed. The tool refuses an archive whose entries carry a PAX `x`/`g` header, because a PAX
-  extension carries `mtime=` and extractors honour that instead of the field being patched — the stamp
-  would be written and silently ignored. (Gradle 9.8 exposes no `Tar.format` to set anyway.)
+  than assumed. The reader refuses an archive whose entries carry a PAX `x`/`g` header, because a PAX
+  extension carries `mtime=` and extractors honour that instead of the field being asserted — the check
+  would pass or fail about a field nothing reads. (Gradle 9.8 exposes no `Tar.format` to set anyway.)
 
-`checkPackage` asserts the result on both formats — a stamping tool nobody checks is a stamping tool
-that silently stops working: every tar entry equals the commit epoch, every zip entry carries the commit
+`checkPackage` asserts the result on both formats — a stamp nobody checks is a stamp that silently
+stops being the commit: every tar entry equals the commit epoch, every zip entry carries the commit
 year. Zip is asserted on the date alone because the format drops the time and the zone; asserting the
-instant would claim a precision the bytes do not have. Verified by building under `TZ=UTC`,
-`TZ=America/Los_Angeles`, `TZ=Asia/Kolkata` and `TZ=America/Sao_Paulo` — the last from a cold
-`.gradle/` — with identical SHA-256 each time, and by sabotage.
+instant would claim a precision the bytes do not have.
 
-**Sabotage the stamp on purpose when you touch it.** Replace each `def stamp = commitStamp()` in
-`build.gradle` with `def stamp = 0L` and run `:checkPackage`: it must fail with
-`zip entry years are not the commit year - expected [1970], found [2098]`. Tar passes that particular
-sabotage, because epoch 0 is what stamp `0` legitimately writes — the zip half is what catches it, which
-is why both formats are asserted rather than one. Restore with the copy you made *before* editing:
+**Sabotage the stamp on purpose when you touch it.** In `build.gradle`, change
+`seconds == null ? null : seconds * 1000L` in the `commitEntryTime` provider to drop the
+milliseconds — the classic unit slip — and run `:checkPackage`. It must fail on both halves:
+
+```
+alchemy-0.9.0-unofficial.tar.gz: tar entry times are not the commit time - expected [1793656258], found [1793656]
+alchemy-0.9.0-unofficial.zip: zip entry years are not the commit year - expected [2026], found [1980]
+```
+
+Tar catches the truncation and zip catches the epoch fallback; either alone would let a plausible-looking
+archive out. Restore with the copy you made *before* editing:
 
 ```bash
 cp build.gradle /tmp/build.gradle.GOOD   # first, always
@@ -240,41 +259,108 @@ silently discards every uncommitted line in that file — including the parts th
 and says nothing while doing it. Nothing in the sabotaged region looks wrong afterwards; you only
 notice that the feature you spent the day on has stopped printing.
 
-**What is not asserted, and how to close it.** `checkPackage` proves the launcher is executable in the
-*extracted* tree (`canExecute()`, on the non-Windows runners, where `unpackDist` preserves the tar mode),
-but no automated check reads the mode field out of the archive itself — so on Windows nothing fails if
-`Alchemy` one day ships at `0644`. The release procedure catches it by hand (`tar -tvzf … | grep Alchemy
-&& unzip -VL … | grep Alchemy`). Closing the gap means a tar/zip *walker* that reports modes as well as
-times; the date code already contains such a walk, so the honest fix is to factor it out and assert both
-in one pass rather than to write a second reader.
+**Byte-level sabotage of a built archive is a false test.** Patching the mtime or a mode field inside
+`build/distributions/*.tar.gz` and re-running `:checkPackage` *passes*, because `distTar` sees that its
+output changed and rebuilds — restamping what you tampered with — before the check ever reads it. So
+producers are sabotaged by editing the producer (the unit slip, above), and *detectors* are validated
+against synthetic archives of known bytes: a ustar/gzip fixture written in Python with the launcher at
+`0644`, a jar at `0666`, an `FNAME`, or a non-zero wrapper mtime, fed to the readers from a scratch
+project whose whole build script is `apply from: '…/gradle/archive-checks.gradle'`. Every failure mode
+above was caught that way, and the well-formed fixture passes, which is the half a sabotage alone never
+proves.
+
+**The checkers refuse what they cannot read.** A tar whose entries carry PAX extension headers is
+rejected rather than read, because PAX mtime overrides the ustar field the reader looks at. So is a
+zip carrying a zip64 end-of-central-directory, on either tell: the 20-byte locator before the EOCD
+record, or the 0xffffffff / 0xffff sentinels a zip64 writes into the plain record's offset and count
+fields. Walking such a file with 32-bit assumptions would wander off to a nonsense offset and come
+back reporting an empty package. A zip whose entries merely carry zip64 *extra fields* while the EOCD
+stays honest has real 32-bit fields and is read normally — `z64_extra.zip` and `z64_eocd.zip` are
+fixtures for exactly that pair, first rejected and second accepted. Running them is what found the
+locator constant to be wrong: the constant I wrote was 0x07064b50, which is the zip64 EOCD **record**
+(`PK\x06\x07`), while the **locator** that sits immediately before the EOCD — the thing this reader
+actually looks for — is `PK\x06\x08`, little-endian 0x08064b50. Reading a spec summary is not the same
+as asserting both fixtures.
+
+**Modes: asserted from the archive bytes, not from the filesystem.** `checkPackage` also runs
+`entryModeProblems(tar, zip, "${distName}/Alchemy")` and `gzipProblems(tar)` from
+`gradle/archive-checks.gradle`, which read the mode fields exactly the way the date code reads the
+time fields — by walking the finished archives. The extracted tree only ever proves that *this*
+machine's archiver and filesystem agreed; `unpackDist` could drop the mode on every platform and
+`canExecute()` would still pass wherever the tar step is skipped. The contract is one executable
+path per archive (the launcher, matched by its full in-archive path, because every entry is prefixed
+by the distribution directory), everything else `0644`, and the two formats agreeing entry by entry.
+
+Three byte-layout facts decide whether such a reader works at all:
+
+- Gradle writes the tar mode as a **full mode word** — `0100644`, not `0644` — so the comparison
+  masks with `& 07777`, and the field's trailing NUL has to be stripped before base-8 parsing.
+- Zip entries declare **MS-DOS as the host** yet carry real unix modes in the external attributes.
+  Gate on the unix file-type bits (`0100000` file, `0040000` directory), never on the host byte,
+  or the reader sees no modes and reports a clean pass over nothing.
+- If a future Gradle stops writing unix modes, every mode reads as absent and the check prints a
+  note instead of asserting. "Not checked, and saying so" beats "checked, and silently vacuous".
+
+The gzip wrapper gets its own assertion, because it is where a build machine leaks: magic, method 8,
+no `FNAME`, no `FCOMMENT`, no `FHCRC`, and an mtime of 0. The mtime has teeth — a non-zero wrapper
+mtime is the moment of building written back into a release whose whole point is that it carries the
+commit instant instead. Gradle writes FLG `0x00` and mtime `0` today; the assertion is what stops
+"happens to" from becoming "no longer".
+
+Both readers only ever read, which was verified rather than assumed: with them in place the built tar
+is byte-identical to the published `v0.9.0` archive member for member except `NOTICE.txt`, which
+differs only because the working tree was dirty at the time.
 
 **The configuration cache is off: what it would buy, and why that is not enough**
 
-Measured on this tree rather than assumed. A warm `:checkPackage` (4 tasks, everything up to date) is
-**0.39s with the cache off and 0.34s with it on**; after `clean`, the build *cache* is what actually
-helps, 1.3s against 1.8s — so `org.gradle.caching` is enabled and
-`org.gradle.configuration-cache` is not. Configuration is not the bottleneck of a build this small.
+`org.gradle.configuration-cache` stays disabled, and the case for leaving it off is now measured
+instead of asserted. The build cache is what helps here at all: `clean checkPackage` is **3s with
+`org.gradle.caching` on and 4s with `--no-build-cache`**, and the full gated pipeline (`clean check
+build distArchive checkPackage verifyDist`, `--no-daemon`, JDK 25, harness and smoke test actually
+executing, under `xvfb-run`) is **4s either way**. Numbers in an earlier draft of this file - 7.3s for
+that pipeline, and "0.05s" for the cache - were taken in states that were not comparable (a cold build
+cache; a wrapper whose own exit path was being timed), and the ones above were taken back-to-back on
+this tree. The same back-to-back runs settle the cost of the stamping rewrite too: the byte-patcher at
+`HEAD` and the Gradle property in the working tree both finish the gated pipeline in 4s.
 
-It also does not currently work, and the way it fails is the lesson. With a warm `.gradle/` every
-configuration-cache build *succeeded* — Gradle was reusing a stored entry. Forcing a fresh store
-(`rm -rf .gradle`) failed immediately:
+It also still does not work, and what fails has changed, which is worth recording:
 
 ```
 > Task :distTar
-> Cannot invoke method tarTimes() on null object    (gradle/archive-stamps.gradle)
+> External process execution requirement
+  - Problem 1/2: external process started 'git log -1 --format=%ct'
+    at build.gradle: line 266   (gitOutput, called from commitStamp)
+  2 problems, 1 unique problem, reported for Build file 'build.gradle'.
 ```
 
-The stamping helpers are closures published into `ext.` by a script plugin. In-process they resolve
-against their script owner and behave; serialized into a cache entry and read back, the owner is gone,
-so a helper calling its neighbours finds `null`. A script plugin cannot declare classes, so the fix is
-`buildSrc` or a class run through `JavaExec` as the harnesses do — machinery that would cost more than
-the tenth of a second, in a project whose standing risk is having too much machinery for 25k lines.
+The script-plugin serialisation failures this section used to describe (`Cannot invoke method
+tarTimes() on null object`) are gone: the closures that caused them were deleted with the patcher.
+What remains is the commit stamp, and the lesson is subtler. `commitEntryTime` *is* a `Provider`, so
+nothing reads it at configuration time in the ordinary build; but a provider that feeds a **task
+input** is queried when Gradle stores the cache entry, and storing is configuration-time work. The
+`git` process therefore still starts during capture, and capture refuses it. Verified failing in every
+state of `.gradle/` (warm, and after `rm -rf`), in ~3.3s, where the same graph without the flag
+succeeds in 3.0s.
+
+The supported shape is a `ValueSource`, whose entire purpose is "an external value, computed when the
+task runs, tracked as an input". `ValueSource` implementations are Java classes and a script plugin
+cannot declare classes, so it means `buildSrc` - plus the `JavaExec` forks in `run`, `smokeTest` and
+`verifyDist` being straightened out, since the cache rejects a task action that forks a process too.
+That is machinery bought for a saving the measurements above put at zero, in a project whose standing
+risk is having too much machinery for 25k lines. The day configuration time becomes worth saving,
+`ValueSource` is the way, and this paragraph is the reason it is not done yet.
+
+Two lessons from the attempt outlive it:
 
 - **A build only ever run with a warm `.gradle/` has not been tested.** When build logic changes, run
-  it once with that directory removed: that is the checkout CI gets.
+  it once with that directory removed: that is the checkout CI gets. The first round of
+  configuration-cache numbers looked encouraging because a warm `.gradle/` was silently *reusing* a
+  stored entry, so every "run" was a reuse and the comparison was between reuse and reuse.
 - **`gradle.properties` is build behaviour.** It was untracked while these settings were being tuned,
   which meant every local build ran in a mode no CI job executed. It is committed now, with the
-  measurements written into it.
+  measurements written into it. A related trap, hit while correcting this section: a command line in
+  the file carried `-PenableCC=true`, a property this build never reads, so the timings labelled
+  "cache ON" beside it had been measured with the cache off.
 
 What the attempt left behind is worth keeping even without the cache: task actions now take plain
 `String`/`File` snapshots (`repoDir`, `versionString`) and `Provider`s (`distTar`/`distZip`

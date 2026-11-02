@@ -27,15 +27,25 @@ plugins {
     id 'java'
 }
 
-apply from: 'gradle/archive-stamps.gradle'
+/*
+ * `reproducibleFileTimestamp` (set on the release archives below) arrived in Gradle 9.7.0. Say
+ * that out loud instead of letting the build die with "unknown property" on a 9.6 install.
+ */
+if (GradleVersion.current() < GradleVersion.version('9.7.0')) {
+    throw new GradleException("Building Alchemy needs Gradle 9.7.0 or newer " +
+            "(reproducibleFileTimestamp); this is ${GradleVersion.current()}. Use ./gradlew.")
+}
+
+apply from: 'gradle/archive-checks.gradle'
 
 /*
- * Bound to locals so task actions can call them: plain `stampArchive(...)` written inside a task
- * action resolves against the task rather than the project's extra properties and fails at
- * execution time with "Could not find method stampArchive()".
+ * Bound to locals so task actions can call them: a plain `entryDateProblems(...)` written inside a
+ * task action resolves against the task rather than the project's extra properties and fails at
+ * execution time with "Could not find method entryDateProblems()".
  */
-def stampArchive = ext.stampArchive
 def entryDateProblems = ext.entryDateProblems
+def entryModeProblems = ext.entryModeProblems
+def gzipProblems = ext.gzipProblems
 
 /*
  * Snapshots of script objects that task actions may not touch: resolving rootDir, calling file(), or
@@ -130,7 +140,10 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.withType(AbstractArchiveTask).configureEach {
     // Reproducible archives: same inputs -> same bytes, so CI can cache and
-    // developers can diff what they are about to ship.
+    // developers can diff what they are about to ship. The two belong together:
+    // reproducibleFileTimestamp is read only when preserveFileTimestamps is false, and
+    // reproducibleFileOrder without it would order an archive whose dates still come from
+    // whoever copied the sources last.
     preserveFileTimestamps = false
     reproducibleFileOrder = true
 }
@@ -243,11 +256,12 @@ def distDir = layout.buildDirectory.dir('dist')
  * which ships inside the archive - is stamped by the build. It says plainly that this is
  * an unofficial community build of an unmaintained upstream.
  *
- * The stamp runs git through ProcessBuilder inside the task, on the reasoning that a
- * build-time side effect belongs to a task. It matters here: the first version read the
- * stamp while configuring with Gradle's exec and a catch-all around it, and every package
- * this session shipped said "commit unknown" - a provenance file that lies quietly is the
- * worst kind. Reading git inside the task makes the stamp visible in the build log.
+ * The stamp reads git with ProcessBuilder rather than Gradle's `exec`, so that one failure cannot be
+ * swallowed twice over, and it is called from exactly two places: the NOTICE.txt task and the archive
+ * entry-date provider below. It matters: the first version read the stamp while configuring with
+ * Gradle's exec and a catch-all around it, and every package this session shipped said "commit
+ * unknown" - a provenance file that lies quietly is the worst kind. The failure path therefore prints
+ * what went wrong instead of going quiet.
  */
 def gitOutput = { File repo, List<String> args ->
     def proc = new ProcessBuilder((['git'] + args)).directory(repo).start()
@@ -281,6 +295,24 @@ def commitStamp = { ->
         println 'archives keep the entry times Gradle wrote and :checkPackage will not assert them'
         return null
     }
+}
+
+/*
+ * The instant handed to the archive tasks, in milliseconds (Gradle stores this property in ms; tar
+ * mtime is seconds, which is why the multiplication is here and why leaving it out is a test case).
+ * Null when building from a tarball with no git metadata, in which case Gradle falls back to its
+ * fixed epoch date and :checkPackage stops asserting dates rather than asserting a fiction.
+ *
+ * A Provider rather than a value, so that the ordinary build never runs git while configuring. It is
+ * worth knowing what that does *not* buy: a provider feeding a task input is queried when the
+ * configuration cache stores its entry, so with `--configuration-cache` git still runs during capture
+ * and the cache refuses the build. The supported way to take an external value as an input is a
+ * ValueSource, which needs buildSrc; see gradle.properties for the measurement that decided the
+ * cache is not worth buildSrc yet.
+ */
+def commitEntryTime = providers.provider {
+    def seconds = commitStamp()
+    seconds == null ? null : seconds * 1000L
 }
 
 def noticeFile = tasks.register('noticeFile') {
@@ -422,12 +454,9 @@ def distTar = tasks.register('distTar', Tar) {
     archiveFileName = "${distBaseName}.tar.gz"
     destinationDirectory = layout.buildDirectory.dir('distributions')
     compression = Compression.GZIP
-    doLast {
-        def stamp = commitStamp()
-        if (stamp != null) {
-            println "tar entry times set to commit ${stamp} for ${stampArchive(archiveFile.get().asFile, stamp)} entries"
-        }
-    }
+    // Every entry dated with the commit instead of the epoch. Gradle writes the bytes;
+    // :checkPackage reads them back out of the finished archive and complains if they are wrong.
+    reproducibleFileTimestamp = commitEntryTime
 }
 
 def distZip = tasks.register('distZip', Zip) {
@@ -441,12 +470,9 @@ def distZip = tasks.register('distZip', Zip) {
     }
     archiveFileName = "${distBaseName}.zip"
     destinationDirectory = layout.buildDirectory.dir('distributions')
-    doLast {
-        def stamp = commitStamp()
-        if (stamp != null) {
-            println "zip entry times set to commit ${stamp} for ${stampArchive(archiveFile.get().asFile, stamp)} entries"
-        }
-    }
+    // Same stamp as the tar. zip carries the date twice (local header and central directory) and
+    // Gradle writes both from UTC, so the result does not depend on the build machine's zone.
+    reproducibleFileTimestamp = commitEntryTime
 }
 
 def distChecksums = tasks.register('distChecksums') {
@@ -494,9 +520,11 @@ def unpackDist = tasks.register('unpackDist', Sync) {
 def checkPackage = tasks.register('checkPackage') {
     group = 'verification'
     description = 'Assert the packed distribution is complete and self-describing'
-    // distZip as well as the unpacked tree: the entry dates exist only in the archives, and
-    // unpacking is where a bad build can hide a problem.
-    dependsOn unpackDist, distZip
+    // Both archives, not just the unpacked tree: the entry dates and modes exist only in the
+    // archives, and unpacking is where a bad build can hide a problem. Naming distTar here
+    // matters on Windows, where unpackDist reads the zip and would otherwise leave the tar
+    // unbuilt and this task reading a file that was never written.
+    dependsOn unpackDist, distTar, distZip
     // Providers, captured while configuring: reaching for the distTar/distZip *task objects* from
     // the action is a configuration-cache violation, and the archive paths are all this needs.
     def tarFile = distTar.flatMap { it.archiveFile }
@@ -558,10 +586,10 @@ def checkPackage = tasks.register('checkPackage') {
             // Entry dates, asserted on the archives themselves: unpacking cannot see them. A
             // stamping tool that nothing checks is a stamping tool that silently stops working,
             // and "silently" is the failure this whole detour exists to avoid.
+            def tarArch = tarFile.get().asFile
+            def zipArch = zipFile.get().asFile
             def stamp = commitStamp()
             if (stamp != null) {
-                def tarArch = tarFile.get().asFile
-                def zipArch = zipFile.get().asFile
                 def dateProblems = entryDateProblems(tarArch, zipArch, stamp)
                 if (dateProblems) {
                     throw new GradleException('Release archive entry dates are wrong:\n  ' +
@@ -570,6 +598,26 @@ def checkPackage = tasks.register('checkPackage') {
                 println "Package check: every entry of ${tarArch.name} and ${zipArch.name} " +
                         "dated with commit ${stamp}"
             }
+            // Modes, likewise read out of the archives. The check above that the unpacked
+            // launcher is executable proves only that this machine's archiver and this
+            // machine's filesystem agreed; it says nothing about the bytes a different
+            // platform's archiver will produce.
+            // Every entry lives under the distribution directory, so the expected name is
+            // the path inside the archive, not the file name.
+            def modeProblems = entryModeProblems(tarArch, zipArch, "${distName}/Alchemy")
+            if (modeProblems) {
+                throw new GradleException('Release archive entry modes are wrong:\n  ' +
+                        modeProblems.join('\n  '))
+            }
+            println "Package check: ${tarArch.name} and ${zipArch.name} carry ${distName}/Alchemy=0755 and nothing else set"
+            // The gzip wrapper is checked whether or not git gave a stamp: it is about what the
+            // wrapper hides (a build path, a build instant), not about dates.
+            def gzProblems = gzipProblems(tarArch)
+            if (gzProblems) {
+                throw new GradleException('Release archive gzip header is wrong:\n  ' +
+                        gzProblems.join('\n  '))
+            }
+            println "Package check: ${tarArch.name} gzip header is clean (no FNAME, no FCOMMENT, mtime 0)"
             println "Package check: Main-Class=${mainClass}, " +
                     "classpath_entries=${entries.size()}, module_archives=${archives.size()}, launcher=${launcher.name}"
         } finally {

@@ -1,0 +1,381 @@
+/*
+ * Archive readers, and the release contract asserted with them.
+ *
+ * Entry dates are produced by Gradle: build.gradle sets `reproducibleFileTimestamp` on every
+ * archive task to the commit time of the tree being released (Gradle 9.7.0 added the property;
+ * build.gradle refuses to run without it). Entry dates are *asserted* here, by reading the
+ * finished archive.
+ *
+ * That division is deliberate. Until mid-2026 the dates were written by a byte-level patcher
+ * living in this file, which meant the code under test was reading its own work: a reader that
+ * misparsed a header and a writer that miswrote one agreed with each other, and the check that
+ * was supposed to catch the other passed. The native property does the same job - archives
+ * built by each mechanism from the same commit compare byte for byte equal - so the patcher
+ * was deleted and these readers stayed. They now audit somebody else's implementation, which
+ * is the only way an assertion can fail usefully.
+ *
+ * What the readers guard:
+ *
+ *  - Entry dates (entryDateProblems). "Deterministic" is proven by the release workflow's
+ *    cross-operating-system checksum comparison; this proves the second half, that the
+ *    dates are the commit rather than the epoch. Unstamped, Gradle writes 1970 (tar) or 1980
+ *    (zip, whose date format cannot represent anything earlier), and users reasonably read a
+ *    1970 launcher as a corrupt or years-stale download.
+ *  - Entry modes (entryModeProblems). "We set the launcher to 0755" is the same kind of claim
+ *    as "we set reproducibleFileTimestamp": a build-script line that nothing proves, and
+ *    extraction is exactly where a mode goes missing. Both formats are read back, and read
+ *    back against each other.
+ *  - The gzip wrapper (gzipProblems) - its own places to hide a build path or a build instant.
+ *
+ * tar stores epoch seconds, so a tar entry matches the commit instant exactly and
+ * timezone-free. zip stores a DOS date with no zone, so readers in other timezones see the
+ * stamp shifted by their offset - the same shift any zip written on another machine would
+ * show. Assertions about zip therefore compare the year, not the instant. Gradle encodes the
+ * DOS date in UTC itself, so the stamp survives a build in any timezone; that is asserted by
+ * the release workflow, not here.
+ *
+ * If the commit time is unavailable (a source tree with no .git), Gradle falls back to the
+ * epoch and no date is asserted. Silence would be worse than a warning, so build.gradle
+ * prints one.
+ */
+
+// The mtime of every entry in a .tar.gz, in archive order. One value per entry so callers can
+// assert the value and count the entries at the same time.
+List<Long> tarTimes(File archive) {
+    byte[] bytes = gunzip(archive)
+    def seen = new ArrayList<Long>()
+    long at = 0
+
+    while (at + 512 <= bytes.length) {
+        boolean blank = true
+        for (int i = (int) at; i < at + 512; i++) {
+            if (bytes[i] != 0) { blank = false; break }
+        }
+        if (blank) break                                       // a zero block ends the archive
+
+        byte[] hdr = new byte[512]
+        System.arraycopy(bytes, (int) at, hdr, 0, 512)
+        if (new String(hdr, 257, 5, 'US-ASCII') != 'ustar') {
+            throw new GradleException("${archive.name}: no ustar magic at byte ${at}, refusing to guess header boundaries")
+        }
+        /*
+         * ustar keeps mtime in the header, which is what the checks below read. PAX keeps a
+         * second mtime in an extension line and extractors honour that one instead, so a PAX
+         * archive is refused rather than silently asserted about a field nothing reads.
+         */
+        String typeflag = new String(hdr, 156, 1, 'US-ASCII')
+        if (typeflag == 'x' || typeflag == 'g') {
+            throw new GradleException("${archive.name}: PAX ${typeflag == 'x' ? 'extended' : 'global'} header at byte ${at}: " +
+                                      'its mtime extension line overrides the header field this check reads')
+        }
+        seen << Long.parseLong(new String(hdr, 136, 11, 'US-ASCII').trim(), 8)
+
+        String sizeField = new String(hdr, 124, 12, 'US-ASCII').trim()
+        long size = sizeField.isEmpty() ? 0L : Long.parseLong(sizeField, 8)
+        at += 512 + (((size + 511) >> 9) << 9)                  // header, then its padded data
+    }
+    return seen
+}
+
+private byte[] gunzip(File archive) {
+    def out = new ByteArrayOutputStream(16 * 1024 * 1024)
+    new java.util.zip.GZIPInputStream(new FileInputStream(archive)).withCloseable { gz ->
+        byte[] chunk = new byte[64 * 1024]
+        int read
+        while ((read = gz.read(chunk)) > 0) {
+            out.write(chunk, 0, read)
+        }
+    }
+    return out.toByteArray()
+}
+
+/*
+ * Every non-directory entry of a .tar.gz as name -> unix mode, in archive order.
+ *
+ * Directories are skipped: they are 0755 in order to be traversable and that has nothing to
+ * do with whether a user can run the launcher. GNU long-name entries are refused rather than
+ * assembled, for the same reason PAX headers are refused above - guessing at a field is worse
+ * than stopping.
+ */
+Map<String, Integer> tarModes(File archive) {
+    byte[] bytes = gunzip(archive)
+    def modes = new LinkedHashMap<String, Integer>()
+    long at = 0
+    while (at + 512 <= bytes.length) {
+        boolean blank = true
+        for (int i = (int) at; i < at + 512; i++) {
+            if (bytes[i] != 0) { blank = false; break }
+        }
+        if (blank) break
+
+        byte[] hdr = new byte[512]
+        System.arraycopy(bytes, (int) at, hdr, 0, 512)
+        if (new String(hdr, 257, 5, 'US-ASCII') != 'ustar') {
+            throw new GradleException("${archive.name}: no ustar magic at byte ${at}, refusing to guess header boundaries")
+        }
+        String typeflag = new String(hdr, 156, 1, 'US-ASCII')
+        if (typeflag == 'x' || typeflag == 'g') {
+            throw new GradleException("${archive.name}: PAX ${typeflag == 'x' ? 'extended' : 'global'} header at byte ${at}")
+        }
+        if (typeflag == 'L') {
+            throw new GradleException("${archive.name}: GNU long-name entry at byte ${at}: this reader does not reassemble them")
+        }
+        String sizeField = new String(hdr, 124, 12, 'US-ASCII').trim()
+        long size = sizeField.isEmpty() ? 0L : Long.parseLong(sizeField, 8)
+        if (typeflag != '5' && typeflag != 'D') {
+            String name = new String(hdr, 0, 100, 'UTF-8').replaceAll('\u0000.*$', '')
+            String prefix = new String(hdr, 345, 155, 'UTF-8').replaceAll('\u0000.*$', '')
+            if (prefix) name = "${prefix}/${name}"
+            String modeField = new String(hdr, 100, 8, 'US-ASCII').trim()
+            // Gradle writes the whole mode word (0100644), not just the permission bits, so
+            // the file type is masked off here once rather than in every comparison below.
+            modes[name] = modeField.isEmpty() ? 0 : (Integer.parseInt(modeField, 8) & 07777)
+        }
+        at += 512 + (((size + 511) >> 9) << 9)
+    }
+    return modes
+}
+
+/*
+ * Every non-directory entry of a zip as name -> unix mode.
+ *
+ * The mode sits in the external attributes. Whether it means anything is normally declared by
+ * the high byte of "version made by" (3 = unix), but Gradle declares MS-DOS while still
+ * writing a real unix mode, so the declaration cannot be the gate - the mode is accepted when
+ * it carries a unix file type, which is the thing the declaration was standing in for. An
+ * archive whose entries carry no mode at all reports -1, so a caller can say "this platform
+ * cannot express the thing being checked" instead of asserting that nothing was executable.
+ */
+Map<String, Integer> zipModes(File archive) {
+    def modes = new LinkedHashMap<String, Integer>()
+    def raf = new RandomAccessFile(archive, 'r')
+    try {
+        long eocd = findZipEnd(raf)
+        if (eocd < 0) throw new GradleException("${archive.name}: no end-of-central-directory record")
+        if (zip64Present(raf, eocd)) {
+            throw new GradleException("${archive.name}: zip64 structures are beyond this reader")
+        }
+        int count = (int) readLe16(raf, eocd + 10)
+        long at = readLe32(raf, eocd + 16)
+        for (int n = 0; n < count; n++) {
+            if (readLe32(raf, at) != 0x02014b50L) {
+                throw new GradleException("${archive.name}: central directory entry ${n} is not where it should be")
+            }
+            int nameLen = (int) readLe16(raf, at + 28)
+            int extraLen = (int) readLe16(raf, at + 30)
+            int commentLen = (int) readLe16(raf, at + 32)
+            long attrs = readLe32(raf, at + 38)
+            long word = (attrs >>> 16) & 0xffffL
+            byte[] nameBytes = new byte[nameLen]
+            raf.seek(at + 46)
+            raf.readFully(nameBytes)
+            String name = new String(nameBytes, 'UTF-8')
+            if (!name.endsWith('/')) {
+                int type = (int) (word & 0170000)
+                modes[name] = (type == 0100000 || type == 0040000) ? (int) (word & 07777) : -1
+            }
+            at += 46 + nameLen + extraLen + commentLen
+        }
+    } finally {
+        raf.close()
+    }
+    return modes
+}
+
+/*
+ * The DOS date of every entry in a zip, read from the central directory.
+ *
+ * Walking starts at the end-of-central-directory record: it is the only place that says how
+ * many entries exist and where they are. Parsing forward from offset 0 would have to cope with
+ * streamed entries whose sizes live in a data descriptor after the data.
+ */
+List<Integer> zipTimes(File archive) {
+    def seen = new ArrayList<Integer>()
+    def raf = new RandomAccessFile(archive, 'r')
+    try {
+        long eocd = findZipEnd(raf)
+        if (eocd < 0) throw new GradleException("${archive.name}: no end-of-central-directory record")
+        if (zip64Present(raf, eocd)) {
+            throw new GradleException("${archive.name}: zip64 structures are beyond this reader")
+        }
+        int count = (int) readLe16(raf, eocd + 10)
+        long at = readLe32(raf, eocd + 16)
+        for (int n = 0; n < count; n++) {
+            if (readLe32(raf, at) != 0x02014b50L) {
+                throw new GradleException("${archive.name}: central directory entry ${n} is not where it should be")
+            }
+            int nameLen = (int) readLe16(raf, at + 28)
+            int extraLen = (int) readLe16(raf, at + 30)
+            int commentLen = (int) readLe16(raf, at + 32)
+            seen << (int) readLe16(raf, at + 14)
+            at += 46 + nameLen + extraLen + commentLen
+        }
+    } finally {
+        raf.close()
+    }
+    return seen
+}
+
+int dosYear(int dosDate) { ((dosDate >> 9) & 0x7f) + 1980 }
+
+/*
+ * Whether this zip uses zip64 structures, which this reader does not understand.
+ *
+ * Two independent tells: the 20-byte end-of-central-directory locator sitting immediately before
+ * EOCD (its four signature bytes 'PK\x06\x08', i.e. little-endian 0x08064b50, at 20 bytes before
+ * the EOCD signature), and the 0xffffffff / 0xffff sentinels a zip64 writes into the plain EOCD's
+ * central-directory offset and entry-count fields. Either means the 32-bit fields here cannot be
+ * trusted, and walking them as if they were would go to offset 4 294 967 295 instead of failing.
+ */
+boolean zip64Present(RandomAccessFile raf, long eocd) {
+    if (eocd >= 20 && readLe32(raf, eocd - 20) == 0x08064b50L) { return true }
+    return readLe32(raf, eocd + 16) == 0xffffffffL || readLe16(raf, eocd + 10) == 0xffffL
+}
+
+private long findZipEnd(RandomAccessFile raf) {
+    // The record is the last 22 bytes unless a comment follows it; comments run to 65 535.
+    int window = (int) Math.min(raf.length(), 65_557L)
+    byte[] tail = new byte[window]
+    raf.seek(raf.length() - window)
+    raf.readFully(tail)
+    for (int i = tail.length - 22; i >= 0; i--) {
+        if (tail[i] == 0x50 && tail[i + 1] == 0x4b && tail[i + 2] == 0x05 && tail[i + 3] == 0x06) {
+            return raf.length() - window + i
+        }
+    }
+    return -1L
+}
+
+private long readLe16(RandomAccessFile f, long at) {
+    byte[] b = new byte[2]
+    f.seek(at); f.readFully(b)
+    return (long) ((b[0] & 0xff) | ((b[1] & 0xff) << 8))
+}
+
+private long readLe32(RandomAccessFile f, long at) {
+    byte[] b = new byte[4]
+    f.seek(at); f.readFully(b)
+    return (b[0] & 0xffL) | ((b[1] & 0xffL) << 8) | ((b[2] & 0xffL) << 16) | ((b[3] & 0xffL) << 24)
+}
+
+/*
+ * The date half of the package contract, as a list of problems (empty means pass).
+ *
+ * tar stores epoch seconds, so an entry can be matched exactly and timezone-free. zip
+ * stores a DOS date with no zone, so the year is compared instead; the year is stable for
+ * any timezone offset a build realistically runs in, while the instant is not.
+ */
+ext.entryDateProblems = { File tarArchive, File zipArchive, Long stamp ->
+    def problems = []
+    def tarStamps = tarTimes(tarArchive).toUnique()
+    if (tarStamps != [stamp]) {
+        problems << "${tarArchive.name}: tar entry times are not the commit time - expected [${stamp}], found ${tarStamps}"
+    }
+    int commitYear = java.time.Instant.ofEpochSecond(stamp).atZone(java.time.ZoneOffset.UTC).year
+    def zipYears = zipTimes(zipArchive).collect { dosYear(it) }.toUnique()
+    if (zipYears != [commitYear]) {
+        problems << "${zipArchive.name}: zip entry years are not the commit year - expected [${commitYear}], found ${zipYears}"
+    }
+    return problems
+}
+
+/*
+ * The gzip wrapper around the tar, as a list of problems (empty means pass).
+ *
+ * The tar half of the release is written through gzip, and that wrapper has its own places to
+ * put a build machine's particulars: an embedded file name (which would carry a CI working
+ * directory), a comment, and an mtime that would shadow the question of when the contents are
+ * from. Gradle happens to write none of them today - magic 1f 8b, method 8, FLG 0x00, mtime 0,
+ * OS byte 255 - and this is what keeps "happens to" from quietly becoming "no longer".
+ *
+ * The mtime check is the one with teeth: a non-zero value there means the moment of building
+ * leaked back into the archive, which is the exact thing commit-stamping exists to prevent.
+ */
+ext.gzipProblems = { File archive ->
+    def problems = []
+    byte[] head = new byte[10]
+    new RandomAccessFile(archive, 'r').withCloseable { raf -> raf.seek(0); raf.readFully(head) }
+    if ((head[0] & 0xff) != 0x1f || (head[1] & 0xff) != 0x8b) {
+        problems << "${archive.name}: does not start with the gzip magic 1f 8b"
+    }
+    if ((head[2] & 0xff) != 8) {
+        problems << "${archive.name}: compression method is ${head[2] & 0xff}, expected 8 (deflate)"
+    }
+    int flg = head[3] & 0xff
+    if ((flg & 0x08) != 0) {
+        problems << "${archive.name}: FNAME is set, so a build-time file name is embedded in the release"
+    }
+    if ((flg & 0x10) != 0) {
+        problems << "${archive.name}: FCOMMENT is set, so build-time text is embedded in the release"
+    }
+    if ((flg & 0x02) != 0) {
+        problems << "${archive.name}: FHCRC is set, which no other producer of this archive writes"
+    }
+    long gzipMtime = (head[4] & 0xffL) | ((head[5] & 0xffL) << 8) | ((head[6] & 0xffL) << 16) | ((head[7] & 0xffL) << 24)
+    if (gzipMtime != 0L) {
+        problems << "${archive.name}: gzip mtime is ${gzipMtime}, expected 0 - the build instant must not appear in the wrapper"
+    }
+    return problems
+}
+
+/*
+ * The mode half of the package contract, as a list of problems (empty means pass).
+ *
+ * Unpacking a release archive and finding the launcher is not enough: the file has to be
+ * runnable, and "runnable" is a field inside the archive that `unpackDist` cannot see because
+ * extraction is where modes get lost or invented. Both formats are therefore read back, and
+ * read back against each other - a distribution whose tar launcher is executable and whose zip
+ * launcher is not is a distribution that works for half the people who download it.
+ *
+ * `executable` is the full entry name of the one entry that must carry the bit, prefix and
+ * all, because every entry in these archives sits under the distribution directory. Everything
+ * else in the package is data, and a 0755 jar or module archive is a sign that modes were
+ * applied by a wildcard.
+ */
+ext.entryModeProblems = { File tarArchive, File zipArchive, String executable ->
+    def problems = []
+    def tar = tarModes(tarArchive)
+    def zip = zipModes(zipArchive)
+
+    def onlyInTar = tar.keySet() - zip.keySet()
+    def onlyInZip = zip.keySet() - tar.keySet()
+    if (onlyInTar) {
+        problems << "${zipArchive.name} is missing ${onlyInTar.size()} entries that ${tarArchive.name} has: ${onlyInTar.take(3)}"
+    }
+    if (onlyInZip) {
+        problems << "${tarArchive.name} is missing ${onlyInZip.size()} entries that ${zipArchive.name} has: ${onlyInZip.take(3)}"
+    }
+
+    def execNames = tar.findAll { name, mode -> (mode & 0111) != 0 }.keySet().toList()
+    if (execNames != [executable]) {
+        problems << "${tarArchive.name}: executable entries are ${execNames}, expected exactly [${executable}]"
+    }
+    if (tar.containsKey(executable) && tar[executable] != 0755) {
+        problems << "${tarArchive.name}: ${executable} has mode ${String.format('%04o', tar[executable])}, expected 0755"
+    }
+    def oddModes = tar.findAll { name, mode -> name != executable && mode != 0644 }
+    if (oddModes) {
+        def shown = oddModes.collect { k, v -> "${k}=${String.format('%04o', v)}" }.take(3)
+        problems << "${tarArchive.name}: ${oddModes.size()} entries are neither ${executable} nor 0644: ${shown}"
+    }
+
+    // Entries that carry no mode word at all (a host with no unix modes) have nothing to
+    // compare, and saying so beats reporting a package with no executable files.
+    def unix = zip.findAll { name, mode -> mode >= 0 }
+    if (!unix) {
+        println "note: ${zipArchive.name} carries no unix modes (built on a host without them); " +
+                'mode agreement between the two formats is not assertable here'
+    } else {
+        def disagree = unix.findAll { name, mode -> tar.containsKey(name) && tar[name] != mode }
+        if (disagree) {
+            problems << "modes differ between the two archives: " +
+                    "${disagree.collect { k, v -> "${k}: tar=${String.format('%04o', tar[k])} zip=${String.format('%04o', v)}" }.take(3)}"
+        }
+        // An entry that is absent was already named by the missing-entry report above; asserting
+        // a mode for a file that is not there would bury that message under a nonsense one.
+        if (zip.containsKey(executable) && zip[executable] != 0755) {
+            problems << "${zipArchive.name}: ${executable} has mode ${String.format('%04o', zip[executable])}, expected 0755"
+        }
+    }
+    return problems
+}
