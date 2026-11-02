@@ -172,6 +172,8 @@ against a JDK that no longer exists.
       `verifyDist` on Linux), so a packaging regression is red on the commit that caused
       it instead of at release time. Proven by sabotage: a `NOTICE.txt` with an
       unsubstituted `@COMMIT@` fails the gate as intended.
+- [x] Archive entries carry the commit date and the launcher keeps its exec bit in both
+      formats; `checkPackage` asserts the dates, the mode and the gzip header.
 - [ ] Windows release gating: the release workflow launch-tests the package on Windows
       informationally (`verify-recipe`), because nobody has yet seen `Alchemy.bat` start
       inside a Windows runner. When that step reports `result=PASS` on a real tag, make
@@ -184,6 +186,102 @@ only check that can see a missing module directory, a jar name the manifest does
 match, or a launcher that forgot `java.library.path`. They share one exception allowlist
 (`SmokeTest.ALLOWED_EXCEPTIONS`) so a trace cannot be forgiven in one and failed in the
 other.
+
+**Entry dates: why the archives are stamped rather than merely sorted**
+
+`reproducibleFileOrder` removes ordering, but Gradle still wrote the moment of building
+into every entry and, with no source files in the archive, that fell back to the epoch: every
+one of the 69 entries in an unpacked Alchemy folder built in November 2026 was dated
+1970-01-02 (tar) or 1980-02-01 (zip). That is worse than a moving timestamp: `tar -tvf` and
+`jar -vft` report 1970 for files that did not exist in 1970, and anyone comparing an old
+download with a new one by mtime would conclude the new one is fifty-six years older.
+
+Gradle 9.8.2 cannot fix this from a copy spec: `FileCopyDetails` exposes `getLastModified()`
+and no setter, `Sync` and `Zip` have no date property, and `preserveFileTimestamps = false`
+only chooses between "use the file" and "use the epoch". So `gradle/archive-stamps.gradle`
+rewrites the entries after the archive is assembled:
+
+- The date is the **commit** instant (`git log -1 --format=%ct`) — the only fact about a
+  release that is both fixed and true. The source date rather than the build date is what
+  makes two rebuilds comparable.
+- It patches bytes in the finished archive instead of re-packing it, so compression, entry
+  order, extra fields and modes are untouched; only the mtime and, for tar, the header
+  checksum change. A re-pack would be a second place for the recipe to be wrong.
+- Zip stores the date twice, in the central directory and in each local header, and DOS
+  dates carry no time zone, so the encoding is done in UTC explicitly rather than by JVM
+  default. `gradle.properties` also pins the build JVM to UTC as insurance against the next
+  plugin that writes a local-time value.
+- Tar needs no format setting: Gradle writes plain ustar headers here, and that is *verified* rather
+  than assumed. The tool refuses an archive whose entries carry a PAX `x`/`g` header, because a PAX
+  extension carries `mtime=` and extractors honour that instead of the field being patched — the stamp
+  would be written and silently ignored. (Gradle 9.8 exposes no `Tar.format` to set anyway.)
+
+`checkPackage` asserts the result on both formats — a stamping tool nobody checks is a stamping tool
+that silently stops working: every tar entry equals the commit epoch, every zip entry carries the commit
+year. Zip is asserted on the date alone because the format drops the time and the zone; asserting the
+instant would claim a precision the bytes do not have. Verified by building under `TZ=UTC`,
+`TZ=America/Los_Angeles`, `TZ=Asia/Kolkata` and `TZ=America/Sao_Paulo` — the last from a cold
+`.gradle/` — with identical SHA-256 each time, and by sabotage.
+
+**Sabotage the stamp on purpose when you touch it.** Replace each `def stamp = commitStamp()` in
+`build.gradle` with `def stamp = 0L` and run `:checkPackage`: it must fail with
+`zip entry years are not the commit year - expected [1970], found [2098]`. Tar passes that particular
+sabotage, because epoch 0 is what stamp `0` legitimately writes — the zip half is what catches it, which
+is why both formats are asserted rather than one. Restore with the copy you made *before* editing:
+
+```bash
+cp build.gradle /tmp/build.gradle.GOOD   # first, always
+# sabotage, run :checkPackage, expect failure
+cp /tmp/build.gradle.GOOD build.gradle
+```
+
+Do not restore with `git checkout -- build.gradle` while the work you are testing is uncommitted. It
+silently discards every uncommitted line in that file — including the parts that were not sabotaged —
+and says nothing while doing it. Nothing in the sabotaged region looks wrong afterwards; you only
+notice that the feature you spent the day on has stopped printing.
+
+**What is not asserted, and how to close it.** `checkPackage` proves the launcher is executable in the
+*extracted* tree (`canExecute()`, on the non-Windows runners, where `unpackDist` preserves the tar mode),
+but no automated check reads the mode field out of the archive itself — so on Windows nothing fails if
+`Alchemy` one day ships at `0644`. The release procedure catches it by hand (`tar -tvzf … | grep Alchemy
+&& unzip -VL … | grep Alchemy`). Closing the gap means a tar/zip *walker* that reports modes as well as
+times; the date code already contains such a walk, so the honest fix is to factor it out and assert both
+in one pass rather than to write a second reader.
+
+**The configuration cache is off: what it would buy, and why that is not enough**
+
+Measured on this tree rather than assumed. A warm `:checkPackage` (4 tasks, everything up to date) is
+**0.39s with the cache off and 0.34s with it on**; after `clean`, the build *cache* is what actually
+helps, 1.3s against 1.8s — so `org.gradle.caching` is enabled and
+`org.gradle.configuration-cache` is not. Configuration is not the bottleneck of a build this small.
+
+It also does not currently work, and the way it fails is the lesson. With a warm `.gradle/` every
+configuration-cache build *succeeded* — Gradle was reusing a stored entry. Forcing a fresh store
+(`rm -rf .gradle`) failed immediately:
+
+```
+> Task :distTar
+> Cannot invoke method tarTimes() on null object    (gradle/archive-stamps.gradle)
+```
+
+The stamping helpers are closures published into `ext.` by a script plugin. In-process they resolve
+against their script owner and behave; serialized into a cache entry and read back, the owner is gone,
+so a helper calling its neighbours finds `null`. A script plugin cannot declare classes, so the fix is
+`buildSrc` or a class run through `JavaExec` as the harnesses do — machinery that would cost more than
+the tenth of a second, in a project whose standing risk is having too much machinery for 25k lines.
+
+- **A build only ever run with a warm `.gradle/` has not been tested.** When build logic changes, run
+  it once with that directory removed: that is the checkout CI gets.
+- **`gradle.properties` is build behaviour.** It was untracked while these settings were being tuned,
+  which meant every local build ran in a mode no CI job executed. It is committed now, with the
+  measurements written into it.
+
+What the attempt left behind is worth keeping even without the cache: task actions now take plain
+`String`/`File` snapshots (`repoDir`, `versionString`) and `Provider`s (`distTar`/`distZip`
+`archiveFile`) instead of resolving `rootDir`, `project`, `file()` or *other task objects* at execution
+time. Those were real configuration-cache violations, and reading configuration-phase objects in the
+execution phase is a bug waiting for the first execution-time oddity — in a build script, the same
+class of lie that a `catch (Exception)` hides in the product.
 
 **Packaging decisions, and why**
 
@@ -393,7 +491,24 @@ Recorded so the next session does not re-open them.
    `java.awt.desktop` instead of `com.apple.eawt` reflection, then re-check the resize
    path. Quaqua 3.x from 2011 is the direct cause of the macOS start-up failures, so
    removing it is both the fix and the removal of the oldest dependency in `lib/`.
+   **The OS floor is macOS 14 (2023)** and the work is planned against the 2023-2027
+   window: macOS 26 has no Quaqua L&F anyway, so the 2007 look was already gone on current
+   systems. Pen input on Apple Silicon depends on Rosetta and therefore inherits Apple's
+   own deadline — Rosetta through macOS 27, reduced to "certain older, unmaintained games"
+   in macOS 28 — so it is best-effort, and no macOS platform work should be sold as making
+   the tablet work on a current Mac.
 3. **Pen-tablet input stays.** JPen and its native libraries are vendored and shipped, and
    the single-archive decision means all three platforms' natives travel together. If a
    future release wants per-platform archives, differentiate on those natives first and
-   assert the result - see Workstream 1b.
+   assert the result - see Workstream 1b. Coverage on macOS is weak and should be stated
+   rather than assumed: `lib/jpen/*.jnilib` is `x86_64` + `i386` + `ppc` with **no `arm64`
+   slice**, so the arm64 CI runners cannot start JPen and the published archive can only be
+   expected to deliver pressure under an `x86_64` JVM through Rosetta.
+4. **Android is parked, with the measurement recorded so it is not re-opened cheaply.** 66
+   of 91 files (82% of LOC) import `javax.swing`; `JPanel`/`JDialog`/`BorderLayout`/
+   `JOptionPane` and modal dialogs are load-bearing, `BufferedImage` is the canvas, PDF
+   export goes through iText and `java.awt.print`, and JPF is desktop classloader
+   technology. Only 11 files (5.6%) import neither AWT nor Swing. An Android release is a
+   new application reusing Alchemy's ideas and file format, not a port of this code: a UI
+   port is months, a core extraction that keeps modules loading is more. Out of scope until
+   someone intends that rewrite.

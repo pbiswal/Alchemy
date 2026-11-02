@@ -275,6 +275,8 @@ jobs:
             echo '  install a 64-bit JDK and try again.'
             echo '- On macOS a window flashes up and the program quits. That is a known fault in'
             echo '  this build, not something you did. macOS is the next thing being fixed.'
+            echo '- Files in the archive are dated the day of the commit they were built from,'
+            echo '  so an unpacked folder shows when it was made rather than 1970.'
             echo '- 32-bit Windows is not supported; no 32-bit build has been made since 2011.'
             echo
             echo '### Checking the download is intact'
@@ -353,9 +355,11 @@ jobs:
             echo '## Reproducibility'
             echo
             echo 'The Windows and macOS jobs build the archive from the same commit and print'
-            echo 'their own SHA-256 to the log. Archive entries are written with fixed timestamps,'
-            echo 'so identical hashes across runners is a real result rather than an artefact of'
-            echo 'timestamps; a difference names the platform where it stopped being true.'
+            echo 'their own SHA-256 to the log. Entry dates come from the commit rather than from'
+            echo 'the moment of building, so identical hashes across runners is a real result'
+            echo 'rather than an artefact of timestamps; a difference names the platform where it'
+            echo 'stopped being true. `gradle/archive-stamps.gradle` does the stamping and'
+            echo '`checkPackage` asserts the dates, on every package build, on both formats.'
             echo
             echo '## Known defects'
             echo
