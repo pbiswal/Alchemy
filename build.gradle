@@ -360,13 +360,13 @@ def releaseIncludes = ['Alchemy', 'Alchemy.bat', 'alchemy.jar', 'NOTICE.txt',
                        'LICENSE.md', 'README.md', 'lib/**', 'modules/**']
 
 /*
- * CI builds one package per platform. Without a classifier all three are named
- * alchemy-<version>-unofficial.tar.gz and cannot be staged side by side, so the
- * release workflow passes -PdistClassifier=linux|windows|macos. Local builds leave it
- * empty and keep the short name.
+ * One package for every platform. The archive carries the JPen native library for
+ * each OS, so there is nothing platform-specific to select and three "per-platform"
+ * archives would be the same bytes under three names. The release workflow therefore
+ * publishes this name once; the other runners build and check it without shipping
+ * their copy.
  */
-def distClassifier = providers.gradleProperty('distClassifier').getOrElse('')
-def distBaseName = distClassifier ? "${distName}-unofficial-${distClassifier}" : "${distName}-unofficial"
+def distBaseName = "${distName}-unofficial"
 
 def distTar = tasks.register('distTar', Tar) {
     description = 'Pack the distribution as a .tar.gz'

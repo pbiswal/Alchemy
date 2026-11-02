@@ -16,8 +16,15 @@
 #     You should have received a copy of the GNU General Public License
 #     along with Alchemy. If not, see <http://www.gnu.org/licenses/>.
 #
-# Publishing pipeline. Pushing a tag shaped like v0.9.0 builds one package per
-# platform on that exact commit and attaches all three to a GitHub Release.
+# Publishing pipeline. Pushing a tag shaped like v0.9.0 builds ONE distribution on
+# that exact commit, launch-tests it, and attaches it to a GitHub Release.
+#
+# There is one package, not three, because there is nothing platform-specific to
+# select: the archive carries the JPen native libraries for every OS. Publishing
+# alchemy-<v>-linux.tar.gz / -macos / -windows would be the same bytes under three
+# names, and a reader would reasonably assume they differ. The three runners still
+# each build and structurally check the package, which is what makes the single
+# archive trustworthy rather than merely convenient - see verify-recipe below.
 #
 # Packaging happens here rather than on a laptop so an artifact cannot carry
 # unrepeatable local state: the tag says which commit, the workflow log says which
@@ -38,20 +45,11 @@ permissions:
 
 jobs:
   package:
-    # One package per platform: lib/jpen holds a different native library per OS, so
-    # a single archive cannot honestly serve all three.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            classifier: linux
-          - os: windows-latest
-            classifier: windows
-          - os: macos-latest
-            classifier: macos
-    name: Package (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # The published bytes are built here, on Linux, because Linux is where the
+    # package can also be launched. A package built on Windows and launched
+    # elsewhere would leave the launch verdict describing a different build.
+    name: Package and launch
+    runs-on: ubuntu-latest
     env:
       GRADLE_EXIT_CODE: 0
     steps:
@@ -73,25 +71,17 @@ jobs:
         # The tag is v0.9.0; the version inside the package is 0.9.0.
         run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and verify package
+      - name: Build, check and launch the package
         shell: bash
-        # The Linux package is launched through its own launcher before it may ship:
-        # that is the only check that can catch a missing module directory or a
-        # manifest path the JVM will not follow. Windows and macOS get the structural
-        # check only, because their start-up paths are separately known-red (Windows:
-        # the resize/toolbar NPE, macOS: Quaqua + com.apple.eawt) - see
-        # MAINTENANCE.md. Packaging still gates on every platform.
+        # verifyDist unpacks the archive and starts it through its own ./Alchemy
+        # launcher: the only check that can see a missing module directory, a jar name
+        # the manifest does not match, or a launcher that forgot java.library.path.
         run: |
-          ARGS=(--no-daemon
-                "-PalchemyVersion=${{ steps.version.outputs.value }}"
-                "-PdistClassifier=${{ matrix.classifier }}"
-                distArchive checkPackage)
-          if [ "${{ matrix.classifier }}" = "linux" ]; then
-            xvfb-run -a --server-args="-screen 0 1280x800x24" \
-              ./gradlew "${ARGS[@]}" verifyDist || echo "GRADLE_EXIT_CODE=$?" >> "$GITHUB_ENV"
-          else
-            ./gradlew "${ARGS[@]}" || echo "GRADLE_EXIT_CODE=$?" >> "$GITHUB_ENV"
-          fi
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            ./gradlew --no-daemon \
+              "-PalchemyVersion=${{ steps.version.outputs.value }}" \
+              distArchive checkPackage verifyDist \
+            || echo "GRADLE_EXIT_CODE=$?" >> "$GITHUB_ENV"
           cat build/distributions/SHA256SUMS.txt
 
       - name: Publish the packaged launch verdict
@@ -107,39 +97,116 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: packages-${{ matrix.classifier }}
+          name: package
           path: build/distributions/
           if-no-files-found: error
           retention-days: 30
 
+  verify-recipe:
+    # Same recipe, other operating systems. Nothing from here is published: these
+    # runners prove the packaging build itself is portable (the launcher bit, the
+    # jar whitelist, the NOTICE stamp) and that their archive is the same one Linux
+    # published, by printing the checksum into the job log for comparison.
+    # Windows additionally tries launching the package, informationally: its start-up
+    # is green in CI, and this is the platform most users have. macOS does not, because
+    # its runtime is known-red - see MAINTENANCE.md.
+    name: Verify packaging recipe (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Version from tag
+        id: version
+        shell: bash
+        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and check the package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon \
+            "-PalchemyVersion=${{ steps.version.outputs.value }}" \
+            distArchive checkPackage
+          {
+            echo "### Packaging recipe on ${{ matrix.os }}"
+            echo
+            echo 'Structural check passed. Checksums built here:'
+            echo
+            echo '```'
+            cat build/distributions/SHA256SUMS.txt
+            echo '```'
+            echo
+            echo 'Gradle writes archive entries with fixed timestamps, so these are expected'
+            echo 'to equal the published archive byte for byte - the v0.9.0 run produced the'
+            echo 'same hash on all three runners. A difference here is a real difference in'
+            echo 'the bytes, not a timestamp.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Deliberately non-blocking: a first run on a real tag has to show whether the
+      # packaged Alchemy.bat starts in a Windows runner at all. When it has been seen
+      # passing, drop this step's if/verdict handling and make verifyDist a normal step
+      # so Windows gates the release the way Linux does.
+      - name: Launch the package here (informational, Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ./gradlew --no-daemon "-PalchemyVersion=${{ steps.version.outputs.value }}" verifyDist
+          then
+            verdict=PASS
+          else
+            verdict=FAIL
+          fi
+          {
+            echo "### Packaged launch on ${{ matrix.os }}"
+            echo
+            echo "- verdict: \`$verdict\` (informational - Windows does not gate the release yet)"
+            echo
+            echo '```'
+            cat build/artifact-result.txt 2>/dev/null || echo '(no result file written)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$verdict" = FAIL ]
+          then
+            echo "::warning::the packaged launcher did not prove itself on ${{ matrix.os }}"
+          fi
+
   release:
     name: Publish GitHub Release
-    needs: package
+    needs: [package, verify-recipe]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Collect the per-platform packages
+      - name: Collect the package
         uses: actions/download-artifact@v6
         with:
+          name: package
           path: assets
 
-      - name: Consolidate checksums
+      - name: Confirm the package survived the artifact round-trip
         working-directory: assets
         shell: bash
-        # Each runner wrote its own SHA256SUMS.txt over its own two archives. One
-        # authoritative list computed over the bytes that actually ship is worth more
-        # than three same-named files: it verifies the download you really made.
+        # The checksums were written by the runner that produced the bytes. Verifying
+        # them again here means the release cannot ship an asset that differs from what
+        # was launch-tested, whoever moved it in between.
         run: |
           set -euo pipefail
-          rm -f */SHA256SUMS.txt
-          find . -mindepth 2 -maxdepth 2 -type f -exec mv -- {} . \;
-          rmdir -- */
-          sha256sum alchemy-* > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
           ls -l
-          cat SHA256SUMS.txt
 
       - name: Release notes
         shell: bash
@@ -155,21 +222,44 @@ jobs:
             echo
             echo '### What ships'
             echo
-            echo '| Asset | Platform | Verified in CI |'
-            echo '| --- | --- | --- |'
-            echo "| \`alchemy-${VERSION}-unofficial-linux.tar.gz\` | Linux x86_64 | Launched from its own launcher: 28/28 modules, no exceptions |"
-            echo "| \`alchemy-${VERSION}-unofficial-windows.zip\` | Windows x86_64 | Files, manifest and launcher checked; start-up still has known issues |"
-            echo "| \`alchemy-${VERSION}-unofficial-macos.zip\` | macOS | Files, manifest and launcher checked; runtime is broken - see MAINTENANCE.md |"
+            echo "| Asset | What it is |"
+            echo '| --- | --- |'
+            echo "| \`alchemy-${VERSION}-unofficial.tar.gz\` | The distribution as a POSIX tarball |"
+            echo "| \`alchemy-${VERSION}-unofficial.zip\` | The same files in a zip |"
+            echo "| \`SHA256SUMS.txt\` | Checksums of both archives |"
             echo
-            echo 'Both a `.tar.gz` and a `.zip` are published per platform; they hold the same'
-            echo 'files. The launcher bit on `./Alchemy` survives in both.'
+            echo 'One package serves every platform: Alchemy is a Java application and the'
+            echo 'archive carries the JPen tablet native libraries for Linux, Windows and'
+            echo 'macOS together, so there is nothing platform-specific to select. Take the'
+            echo 'format your operating system unpacks most easily - the launcher bit on'
+            echo '`./Alchemy` survives in both.'
+            echo
+            echo '### How it was verified'
+            echo
+            echo '| Check | Where |'
+            echo '| --- | --- |'
+            echo '| Unpacked and started through its own `./Alchemy` launcher: 28/28 modules active, no exceptions | Linux under Xvfb |'
+            echo '| Package contents, manifest, launcher bit and module count | Linux, Windows and macOS runners |'
+            echo "| \`NOTICE.txt\` names the commit these bytes came from | \`${GITHUB_SHA:0:12}\` |"
+            echo
+            echo '### Known state per platform'
+            echo
+            echo '- **Linux** - starts and is launch-tested in CI.'
+            echo '- **Windows** - the CI smoke test is green and the package is structurally'
+            echo '  checked, but the packaged launcher is not launch-tested in CI yet.'
+            echo '- **macOS** - the runtime is broken: Quaqua 3.x and the old'
+            echo '  `com.apple.eawt` adapter do not survive modern JDKs, so menu actions and'
+            echo '  window chrome are unreliable. It is packaged, not fixed.'
+            echo
+            echo 'See [MAINTENANCE.md](https://github.com/pbiswal/Alchemy/blob/'"${GITHUB_REF_NAME}"'/MAINTENANCE.md)'
+            echo 'for build instructions, test commands and the full list of known issues.'
             echo
             echo '### Running it'
             echo
             echo 'Needs a JDK 17 or newer on `PATH` (or `JAVA_HOME` set). Unpack, then:'
             echo
             echo '```sh'
-            echo './Alchemy        # Linux'
+            echo './Alchemy        # Linux, macOS'
             echo 'Alchemy.bat      # Windows'
             echo '```'
             echo
@@ -179,10 +269,10 @@ jobs:
             echo '### Verify'
             echo
             echo '```sh'
-            echo "grep \"\$\(basename ARCHIVE\)\" SHA256SUMS.txt | sha256sum -c -"
+            # Single quotes on purpose: this line is a shell snippet to be pasted, not
+            # one to be expanded here.
+            echo 'grep "$(basename ARCHIVE)" SHA256SUMS.txt | sha256sum -c -'
             echo '```'
-            echo
-            echo "Build instructions, test commands and known issues: [MAINTENANCE.md](https://github.com/pbiswal/Alchemy/blob/${GITHUB_REF_NAME}/MAINTENANCE.md)."
           } > RELEASE_BODY.md
           cat RELEASE_BODY.md
 
