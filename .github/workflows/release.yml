@@ -32,9 +32,9 @@
 #
 # Two documents for two audiences. The release body is user-facing: what the program
 # is, which file to download, how to start it, what to expect. It names no Gradle task,
-# no CI job and no exception trace. The developer-facing half - provenance, toolchain,
+# no CI job and no exception trace. The technical half - provenance, toolchain,
 # what was verified on which OS, known defects, how to build it - is generated as
-# DEVELOPER_NOTES.md and attached as an asset. Both are generated here rather than
+# RELEASE_NOTES.md and attached as an asset. Both are generated here rather than
 # written by hand, so neither can drift from the tag it describes, and neither has to
 # serve the other's reader.
 #
@@ -220,7 +220,7 @@ jobs:
         shell: bash
         # Two documents, two audiences. This one is for somebody who wants to draw:
         # what it is, which file to download, how to start it, what to expect. No task
-        # names, no CI job names, no exception traces - those all go to DEVELOPER_NOTES.md.
+        # names, no CI job names, no exception traces - those all go to RELEASE_NOTES.md.
         # Backticks are bare inside single quotes; \"`\" only where the line is double-quoted.
         run: |
           set -euo pipefail
@@ -296,7 +296,7 @@ jobs:
             echo '### Also in this release'
             echo
             echo '- **NOTICE.txt**, inside the archive: who wrote what, and the licence terms.'
-            echo '- **DEVELOPER_NOTES.md**, attached below: how this build was made and tested,'
+            echo '- **RELEASE_NOTES.md**, attached below: how this build was made and tested,'
             echo '  what is known to be broken, and how to build it yourself. Ignore it if you'
             echo '  just want to draw.'
             echo "- Source: https://github.com/pbiswal/Alchemy at tag \`$GITHUB_REF_NAME\`."
@@ -304,7 +304,7 @@ jobs:
           } > RELEASE_BODY.md
           cat RELEASE_BODY.md
 
-      - name: Developer notes
+      - name: Technical notes
         shell: bash
         run: |
           set -euo pipefail
@@ -313,9 +313,9 @@ jobs:
           MODCOUNT=$(tar tzf "$TARBALL" | grep -c '/modules/.*\.zip$' || true)
           LIBCOUNT=$(tar tzf "$TARBALL" | grep -c '/lib/.*\.jar$' || true)
           {
-            echo "# Developer notes for v${VERSION}"
+            echo "# Technical notes for v${VERSION}"
             echo
-            echo 'Technical detail. The user-facing notes are the release description itself.'
+            echo 'The release description is the user-facing note; this file is the build report behind it.'
             echo
             echo '## Provenance'
             echo
@@ -391,8 +391,8 @@ jobs:
             echo 'published are gone (28 remain and 28 activate at start-up); a resize during'
             echo 'start-up no longer dereferences a toolbar that does not exist yet; releases are'
             echo 'built and published by CI from a tag instead of by hand.'
-          } > DEVELOPER_NOTES.md
-          cat DEVELOPER_NOTES.md
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
         env:
           GITHUB_RUN_ID: ${{ github.run_id }}
 
@@ -414,6 +414,6 @@ jobs:
             assets/*.tar.gz
             assets/*.zip
             assets/SHA256SUMS.txt
-            DEVELOPER_NOTES.md
+            RELEASE_NOTES.md
           fail_on_unmatched_files: true
           make_latest: 'true'

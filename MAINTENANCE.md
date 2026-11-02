@@ -244,7 +244,7 @@ Four release-specific rules:
 - **Two audiences get two documents.** The release body is for somebody who wants to draw:
   what the program is, which file to download, how to start it, what to expect when it fails.
   It names no Gradle task, no CI job, no exception trace. Provenance, toolchain, the per-OS
-  verification matrix, known defects and build commands go in `DEVELOPER_NOTES.md`, attached
+  verification matrix, known defects and build commands go in `RELEASE_NOTES.md`, attached
   as an asset. A single body written for both serves neither: the person installing Alchemy
   does not want to read about `continue-on-error`, and the person auditing the build should
   not have to hunt through end-user prose to find it.
