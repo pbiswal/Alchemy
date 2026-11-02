@@ -232,7 +232,7 @@ Runs on tags matching `vA.B.C` and nowhere else, so an ordinary push can never p
 - A `release` job publishes with auto-generated notes and nothing else. If the package
   job fails, no release is created, so a failed release can never point at half a build.
 
-Two release-specific rules:
+Four release-specific rules:
 
 - **The notes are generated, never hand-written.** They must keep telling the truth about
   the platform that starts and the platform that is merely packaged - that is the
@@ -241,6 +241,19 @@ Two release-specific rules:
   why the workflow now publishes a single package.
 - **The artifact round-trip is verified** (`sha256sum -c`) after download, because the
   published bytes are the ones that survive upload, not the ones the build printed.
+- **Two audiences get two documents.** The release body is for somebody who wants to draw:
+  what the program is, which file to download, how to start it, what to expect when it fails.
+  It names no Gradle task, no CI job, no exception trace. Provenance, toolchain, the per-OS
+  verification matrix, known defects and build commands go in `DEVELOPER_NOTES.md`, attached
+  as an asset. A single body written for both serves neither: the person installing Alchemy
+  does not want to read about `continue-on-error`, and the person auditing the build should
+  not have to hunt through end-user prose to find it.
+- **Backticks in generated markdown, both directions.** Inside a single-quoted shell string a
+  backtick is already literal, so `\`` emits a backslash. Inside a double-quoted string a bare
+  backtick begins a command substitution, so it must be escaped. Both mistakes render text
+  that looks *nearly* right, which is why the generated notes are read as rendered markdown
+  before shipping rather than eyeballed in a YAML diff - the first draft had the first
+  mistake in sixteen lines and the second in two.
 
 Do not upload hand-built artifacts from a laptop: a tag-triggered build records which
 commit and toolchain produced the bytes, and a hand-pushed artifact silently breaks

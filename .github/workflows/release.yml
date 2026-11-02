@@ -30,6 +30,14 @@
 # unrepeatable local state: the tag says which commit, the workflow log says which
 # toolchain, and NOTICE.txt inside the archive says both.
 #
+# Two documents for two audiences. The release body is user-facing: what the program
+# is, which file to download, how to start it, what to expect. It names no Gradle task,
+# no CI job and no exception trace. The developer-facing half - provenance, toolchain,
+# what was verified on which OS, known defects, how to build it - is generated as
+# DEVELOPER_NOTES.md and attached as an asset. Both are generated here rather than
+# written by hand, so neither can drift from the tag it describes, and neither has to
+# serve the other's reader.
+#
 name: Release
 
 on:
@@ -208,73 +216,185 @@ jobs:
           sha256sum -c SHA256SUMS.txt
           ls -l
 
-      - name: Release notes
+      - name: Release notes (user-facing)
+        shell: bash
+        # Two documents, two audiences. This one is for somebody who wants to draw:
+        # what it is, which file to download, how to start it, what to expect. No task
+        # names, no CI job names, no exception traces - those all go to DEVELOPER_NOTES.md.
+        # Backticks are bare inside single quotes; \"`\" only where the line is double-quoted.
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARGZ="alchemy-${VERSION}-unofficial.tar.gz"
+          ZIP="alchemy-${VERSION}-unofficial.zip"
+          {
+            echo 'Alchemy is a drawing program for pen and tablet: choose a shape, draw it,'
+            echo 'and modules change what you drew. Karl D.D. Willis wrote it between 2007 and'
+            echo '2011 and released it under the GNU GPL v3.'
+            echo
+            echo "### Alchemy ${VERSION} (unofficial build)"
+            echo
+            echo 'This is the same program rebuilt so that it starts on a current 64-bit Java'
+            echo 'instead of a 2007 one. It is not a new version of Alchemy, and it is not from'
+            echo 'the original project, which has been quiet since 2018.'
+            echo
+            echo '### What you need'
+            echo
+            echo 'Java 17 or newer, 64-bit - 17, 21 and 25 are all fine. Nothing else: no'
+            echo 'installer, no admin rights, no internet once the download is finished.'
+            echo
+            echo '### Download and run'
+            echo
+            echo '| Your system | Download | To start it |'
+            echo '| --- | --- | --- |'
+            echo "| Windows | \`$ZIP\` | Unpack, then double-click **Alchemy.bat** |"
+            echo "| Linux | \`$TARGZ\` | Unpack, open a terminal in the new folder, run \`./Alchemy\` |"
+            echo "| macOS | \`$TARGZ\` | Unpack, open a terminal in the new folder, run \`./Alchemy\` - and read the macOS note below |"
+            echo
+            echo "Unpack it somewhere you are allowed to write, such as your Desktop or Home"
+            echo "folder - not Program Files. It unpacks to one folder, \`alchemy-$VERSION\`, and"
+            echo 'everything is inside it.'
+            echo
+            echo 'Alchemy keeps your drawings and its own log in folders next to itself, so it'
+            echo 'will not work somewhere that forbids writing.'
+            echo
+            echo 'Nothing is installed on your system, which means deleting that folder removes'
+            echo 'Alchemy. Your drawings are in its `shapes` folder, so copy that out first.'
+            echo
+            echo '### Does my tablet work?'
+            echo
+            echo 'Yes. Wacom tablets work on Windows and Linux, and pen pressure changes the'
+            echo 'width of the line. A mouse works on every system.'
+            echo
+            echo '### What to expect'
+            echo
+            echo '- It looks like 2007. That is deliberate: nothing about the interface has been'
+            echo '  changed.'
+            echo '- If no window appears, the cause is almost always Java. Run `java -version` in'
+            echo '  a terminal and check it says 17 or higher. If it says `command not found`,'
+            echo '  install a 64-bit JDK and try again.'
+            echo '- On macOS a window flashes up and the program quits. That is a known fault in'
+            echo '  this build, not something you did. macOS is the next thing being fixed.'
+            echo '- 32-bit Windows is not supported; no 32-bit build has been made since 2011.'
+            echo
+            echo '### Checking the download is intact'
+            echo
+            echo 'Save **SHA256SUMS.txt** in the same folder as the archive, then:'
+            echo
+            echo '```sh'
+            echo 'sha256sum -c SHA256SUMS.txt    # Linux, macOS'
+            echo '```'
+            echo
+            echo 'On Windows, run'
+            echo
+            echo '```cmd'
+            echo "certutil -hashfile $ZIP SHA256"
+            echo '```'
+            echo
+            echo 'and compare the printed value with the one listed in SHA256SUMS.txt.'
+            echo
+            echo '### Also in this release'
+            echo
+            echo '- **NOTICE.txt**, inside the archive: who wrote what, and the licence terms.'
+            echo '- **DEVELOPER_NOTES.md**, attached below: how this build was made and tested,'
+            echo '  what is known to be broken, and how to build it yourself. Ignore it if you'
+            echo '  just want to draw.'
+            echo "- Source: https://github.com/pbiswal/Alchemy at tag \`$GITHUB_REF_NAME\`."
+            echo '- Releases from the original project, back in 2011, are still where they were.'
+          } > RELEASE_BODY.md
+          cat RELEASE_BODY.md
+
+      - name: Developer notes
         shell: bash
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          TARBALL=$(echo assets/alchemy-*.tar.gz)
+          MODCOUNT=$(tar tzf "$TARBALL" | grep -c '/modules/.*\.zip$' || true)
+          LIBCOUNT=$(tar tzf "$TARBALL" | grep -c '/lib/.*\.jar$' || true)
           {
-            echo "### Unofficial build of Alchemy ${VERSION}"
+            echo "# Developer notes for v${VERSION}"
             echo
-            echo 'Built from `'"${GITHUB_SHA:0:12}"'` by GitHub Actions. The upstream project'
-            echo '(karldd/Alchemy) has been unmaintained since 2018; this is a community-kept'
-            echo 'build, not a release by the original author.'
+            echo 'Technical detail. The user-facing notes are the release description itself.'
             echo
-            echo '### What ships'
+            echo '## Provenance'
             echo
-            echo "| Asset | What it is |"
+            echo '| | |'
             echo '| --- | --- |'
-            echo "| \`alchemy-${VERSION}-unofficial.tar.gz\` | The distribution as a POSIX tarball |"
-            echo "| \`alchemy-${VERSION}-unofficial.zip\` | The same files in a zip |"
-            echo "| \`SHA256SUMS.txt\` | Checksums of both archives |"
+            echo "| Tag | \`$GITHUB_REF_NAME\` |"
+            echo "| Commit | \`${GITHUB_SHA:0:12}\` |"
+            echo "| Built by | run \`$GITHUB_RUN_ID\` from \`.github/workflows/release.yml\` |"
+            echo '| Workflow run | https://github.com/pbiswal/Alchemy/actions/runs/'"$GITHUB_RUN_ID"' |'
+            echo '| Build JDK | 17, compiled with `--release 17` |'
+            echo '| Runtime downloads | none - dependencies are vendored under `lib/` |'
+            echo '| Artifacts | one portable pair: `lib/jpen` carries the native tablet library for every OS |'
             echo
-            echo 'One package serves every platform: Alchemy is a Java application and the'
-            echo 'archive carries the JPen tablet native libraries for Linux, Windows and'
-            echo 'macOS together, so there is nothing platform-specific to select. Take the'
-            echo 'format your operating system unpacks most easily - the launcher bit on'
-            echo '`./Alchemy` survives in both.'
+            echo '## Inside the archive'
             echo
-            echo '### How it was verified'
+            echo "\`alchemy.jar\` (thin jar with a \`Class-Path\` manifest), $LIBCOUNT dependency jars in"
+            echo "\`lib/\`, JPen plus its native libraries in \`lib/jpen/\`, $MODCOUNT module archives in"
+            echo '`modules/`, the launchers `Alchemy` and `Alchemy.bat`, and `NOTICE.txt`,'
+            echo '`LICENSE.md` and `README.md`. Produced by `./gradlew distArchive` from a whitelisted'
+            echo 'staging layout, so nothing ships because it happened to be lying around.'
             echo
-            echo '| Check | Where |'
-            echo '| --- | --- |'
-            echo '| Unpacked and started through its own `./Alchemy` launcher: 28/28 modules active, no exceptions | Linux under Xvfb |'
-            echo '| Package contents, manifest, launcher bit and module count | Linux, Windows and macOS runners |'
-            echo "| \`NOTICE.txt\` names the commit these bytes came from | \`${GITHUB_SHA:0:12}\` |"
+            echo '## What was verified, and where'
             echo
-            echo '### Known state per platform'
+            echo '| Check | Linux | Windows | macOS |'
+            echo '| --- | --- | --- | --- |'
+            echo '| Compiles on JDK 17 / 21 / 25 | yes | yes | yes |'
+            echo '| Archive built, contents validated | yes | yes | yes |'
+            echo '| Archive launched through its own launcher | yes, gating | runs, not gating yet | no |'
+            echo '| All modules activate | yes | runs, not gated | no |'
             echo
-            echo '- **Linux** - starts and is launch-tested in CI.'
-            echo '- **Windows** - the CI smoke test is green and the package is structurally'
-            echo '  checked, but the packaged launcher is not launch-tested in CI yet.'
-            echo '- **macOS** - the runtime is broken: Quaqua 3.x and the old'
-            echo '  `com.apple.eawt` adapter do not survive modern JDKs, so menu actions and'
-            echo '  window chrome are unreliable. It is packaged, not fixed.'
+            echo '"Runs, not gating yet" means the check executes and its verdict is published,'
+            echo 'but a failure does not stop the release. It becomes a gate once it has been'
+            echo 'seen passing on a real tag, and promoting it is a one-line change.'
             echo
-            echo 'See [MAINTENANCE.md](https://github.com/pbiswal/Alchemy/blob/'"${GITHUB_REF_NAME}"'/MAINTENANCE.md)'
-            echo 'for build instructions, test commands and the full list of known issues.'
+            echo '## Reproducibility'
             echo
-            echo '### Running it'
+            echo 'The Windows and macOS jobs build the archive from the same commit and print'
+            echo 'their own SHA-256 to the log. Archive entries are written with fixed timestamps,'
+            echo 'so identical hashes across runners is a real result rather than an artefact of'
+            echo 'timestamps; a difference names the platform where it stopped being true.'
             echo
-            echo 'Needs a JDK 17 or newer on `PATH` (or `JAVA_HOME` set). Unpack, then:'
+            echo '## Known defects'
+            echo
+            echo '- macOS start-up: `com.bric.util.MacUtil` throws `NumberFormatException` while'
+            echo '  parsing a resource in the vendored Quaqua jar, and the 2011 `OSXAdapter` is'
+            echo '  refused reflective access to `com.apple.eawt.Application`. Removing Quaqua in'
+            echo '  favour of the system look and feel is the planned fix; until then the macOS'
+            echo '  smoke test runs with `continue-on-error`.'
+            echo '- `AlcNative` has no source in this repository. It is not loaded on Linux, and'
+            echo '  its only callers are macOS menu-bar toggles.'
+            echo '- The `Alchemy.bat` launcher is executed inside a Windows runner by'
+            echo '  `verifyDist`, informationally. Until that is observed passing on a tag, the'
+            echo '  Windows launcher counts as unverified on real Windows hardware.'
+            echo '- The launchers write to the installation directory (`log/`, `shapes/`), so a'
+            echo '  read-only location prevents start-up. Moving that state to a per-user'
+            echo '  directory is open work.'
+            echo
+            echo '## Build and test from source'
             echo
             echo '```sh'
-            echo './Alchemy        # Linux, macOS'
-            echo 'Alchemy.bat      # Windows'
+            echo 'git clone https://github.com/pbiswal/Alchemy.git'
+            echo "cd Alchemy && git checkout $GITHUB_REF_NAME"
+            echo './gradlew clean build distArchive    # package plus checksums'
+            echo './gradlew harnessTest                # log-parser checks, no display needed'
+            echo './gradlew smokeTest                  # boots the app; needs a display (xvfb-run)'
+            echo './gradlew verifyDist                 # launches the unpacked archive via its launcher'
             echo '```'
             echo
-            echo 'A Wacom tablet is picked up through JPen where the packaged native library'
-            echo 'matches the platform.'
+            echo '## Since the 2011 official release (008)'
             echo
-            echo '### Verify'
-            echo
-            echo '```sh'
-            # Single quotes on purpose: this line is a shell snippet to be pasted, not
-            # one to be expanded here.
-            echo 'grep "$(basename ARCHIVE)" SHA256SUMS.txt | sha256sum -c -'
-            echo '```'
-          } > RELEASE_BODY.md
-          cat RELEASE_BODY.md
+            echo 'Gradle build alongside the legacy NetBeans/Ant project; CI across Linux,'
+            echo 'Windows and macOS on JDK 17/21/25; the five modules whose source was never'
+            echo 'published are gone (28 remain and 28 activate at start-up); a resize during'
+            echo 'start-up no longer dereferences a toolbar that does not exist yet; releases are'
+            echo 'built and published by CI from a tag instead of by hand.'
+          } > DEVELOPER_NOTES.md
+          cat DEVELOPER_NOTES.md
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
 
       # softprops/action-gh-release, pinned to a released tag. `files` is a
       # newline-delimited list of globs, and a glob that matches nothing is NOT an error
@@ -294,5 +414,6 @@ jobs:
             assets/*.tar.gz
             assets/*.zip
             assets/SHA256SUMS.txt
+            DEVELOPER_NOTES.md
           fail_on_unmatched_files: true
           make_latest: 'true'
